@@ -1,12 +1,9 @@
 # Binários compilados
-streamswitch
-streamswitch_final
+
 *.exe
 
 # Mídia do usuário
-fallback.*
-watermark.png
-queda.jpeg
+
 
 # Sistema
 .DS_Store
