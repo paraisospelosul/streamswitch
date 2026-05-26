@@ -21,12 +21,13 @@ import (
 //go:embed web/*
 var webFS embed.FS
 
-// APIServer handles the web UI and REST API
 type APIServer struct {
 	switcher      *Switcher
 	outputManager *OutputManager
 	sysStats      *SysStatsMonitor
 	preview       *PreviewManager
+	audioMeter    *AudioMeter
+	recorder      *Recorder
 	dataDir       string
 	port          int
 
@@ -35,32 +36,32 @@ type APIServer struct {
 	clientsMu sync.Mutex
 }
 
-func NewAPIServer(switcher *Switcher, outputManager *OutputManager, sysStats *SysStatsMonitor, preview *PreviewManager, dataDir string, port int) *APIServer {
+func NewAPIServer(switcher *Switcher, outputManager *OutputManager, sysStats *SysStatsMonitor, preview *PreviewManager, audioMeter *AudioMeter, recorder *Recorder, dataDir string, port int) *APIServer {
 	return &APIServer{
 		switcher:      switcher,
 		outputManager: outputManager,
 		sysStats:      sysStats,
 		preview:       preview,
+		audioMeter:    audioMeter,
+		recorder:      recorder,
 		dataDir:       dataDir,
 		port:          port,
-		upgrader: websocket.Upgrader{
-			CheckOrigin: func(r *http.Request) bool { return true },
-		},
-		clients: make(map[*websocket.Conn]bool),
+		upgrader:      websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }},
+		clients:       make(map[*websocket.Conn]bool),
 	}
 }
 
-// StatusResponse is the full status payload sent via WebSocket and GET /api/status
 type StatusResponse struct {
-	System   SystemStats   `json:"system"`
-	Switcher SwitcherStats `json:"switcher"`
-	Outputs  []OutputStats `json:"outputs"`
+	System    SystemStats     `json:"system"`
+	Switcher  SwitcherStats   `json:"switcher"`
+	Outputs   []OutputStats   `json:"outputs"`
+	Audio     AudioLevels     `json:"audio"`
+	Recording RecordingStatus `json:"recording"`
 }
 
 func (s *APIServer) Run() error {
 	mux := http.NewServeMux()
 
-	// API routes
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/config", s.handleConfig)
 	mux.HandleFunc("/api/outputs", s.handleOutputs)
@@ -69,49 +70,47 @@ func (s *APIServer) Run() error {
 	mux.HandleFunc("/api/upload/watermark", s.handleUploadWatermark)
 	mux.HandleFunc("/api/preview/frame", s.handlePreviewFrame)
 	mux.HandleFunc("/api/preview/settings", s.handlePreviewSettings)
+	mux.HandleFunc("/api/actions/", s.handleQuickAction)
+	mux.HandleFunc("/api/history", s.handleHistory)
+	mux.HandleFunc("/api/recording", s.handleRecording)
+	mux.HandleFunc("/api/recordings", s.handleRecordings)
+	mux.HandleFunc("/api/recordings/", s.handleRecordingAction)
 	mux.HandleFunc("/ws", s.handleWebSocket)
 
-	// Static files (embedded web UI)
 	webContent, err := fs.Sub(webFS, "web")
 	if err != nil {
 		return fmt.Errorf("embed fs: %w", err)
 	}
 	mux.Handle("/", http.FileServer(http.FS(webContent)))
 
-	// Start WebSocket broadcaster
 	go s.broadcastLoop()
 
 	addr := fmt.Sprintf(":%d", s.port)
-	log.Printf("[server] Web UI available at http://0.0.0.0%s", addr)
+	log.Printf("[server] Web UI at http://0.0.0.0%s", addr)
 	return http.ListenAndServe(addr, mux)
 }
 
-// GET /api/status
+// ─── Status ───
+
 func (s *APIServer) handleStatus(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
 	resp := StatusResponse{
-		System:   s.sysStats.GetStats(),
-		Switcher: s.switcher.GetStats(),
-		Outputs:  s.outputManager.GetStats(),
+		System:    s.sysStats.GetStats(),
+		Switcher:  s.switcher.GetStats(),
+		Outputs:   s.outputManager.GetStats(),
+		Audio:     s.audioMeter.GetLevels(),
+		Recording: s.recorder.GetStatus(),
 	}
-
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
 
-// GET/PUT /api/config
+// ─── Config ───
+
 func (s *APIServer) handleConfig(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-
 	switch r.Method {
 	case http.MethodGet:
-		cfg := s.switcher.GetConfig()
-		json.NewEncoder(w).Encode(cfg)
-
+		json.NewEncoder(w).Encode(s.switcher.GetConfig())
 	case http.MethodPut:
 		var cfg SwitcherConfig
 		if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
@@ -120,28 +119,24 @@ func (s *APIServer) handleConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		s.switcher.UpdateConfig(cfg)
 		json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
-
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
-// GET/POST /api/outputs
+// ─── Outputs ───
+
 func (s *APIServer) handleOutputs(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-
 	switch r.Method {
 	case http.MethodGet:
-		outputs := s.outputManager.GetOutputs()
-		json.NewEncoder(w).Encode(outputs)
-
+		json.NewEncoder(w).Encode(s.outputManager.GetOutputs())
 	case http.MethodPost:
 		var config OutputConfig
 		if err := json.NewDecoder(r.Body).Decode(&config); err != nil {
 			http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
 			return
 		}
-
 		if config.ID == "" {
 			config.ID = fmt.Sprintf("out_%d", time.Now().UnixMilli())
 		}
@@ -151,31 +146,23 @@ func (s *APIServer) handleOutputs(w http.ResponseWriter, r *http.Request) {
 		if config.Codec == "" {
 			config.Codec = CodecH265Passthrough
 		}
-
 		if err := s.outputManager.AddOutput(config); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
 		}
-
 		w.WriteHeader(http.StatusCreated)
 		json.NewEncoder(w).Encode(config)
-
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
-// Routes: /api/outputs/{id}, /api/outputs/{id}/start, /api/outputs/{id}/stop
 func (s *APIServer) handleOutputAction(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-
-	// Parse path: /api/outputs/{id}[/action]
 	path := r.URL.Path[len("/api/outputs/"):]
 	id := path
 	action := ""
-
-	// Check for action suffix
 	for _, a := range []string{"/start", "/stop", "/logs"} {
 		if len(path) > len(a) && path[len(path)-len(a):] == a {
 			id = path[:len(path)-len(a)]
@@ -183,7 +170,6 @@ func (s *APIServer) handleOutputAction(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
-
 	switch {
 	case action == "start" && r.Method == http.MethodPost:
 		if err := s.outputManager.StartOutput(id); err != nil {
@@ -192,7 +178,6 @@ func (s *APIServer) handleOutputAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]string{"status": "started"})
-
 	case action == "stop" && r.Method == http.MethodPost:
 		if err := s.outputManager.StopOutput(id); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
@@ -200,7 +185,6 @@ func (s *APIServer) handleOutputAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]string{"status": "stopped"})
-
 	case action == "logs" && r.Method == http.MethodGet:
 		logs, err := s.outputManager.GetLogs(id)
 		if err != nil {
@@ -209,7 +193,6 @@ func (s *APIServer) handleOutputAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]interface{}{"logs": logs})
-
 	case action == "" && r.Method == http.MethodPut:
 		var config OutputConfig
 		if err := json.NewDecoder(r.Body).Decode(&config); err != nil {
@@ -222,7 +205,6 @@ func (s *APIServer) handleOutputAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
-
 	case action == "" && r.Method == http.MethodDelete:
 		if err := s.outputManager.RemoveOutput(id); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
@@ -230,72 +212,182 @@ func (s *APIServer) handleOutputAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]string{"status": "deleted"})
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// ─── Quick Actions ───
+
+func (s *APIServer) handleQuickAction(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	action := r.URL.Path[len("/api/actions/"):]
+	switch action {
+	case "restart-srt":
+		s.switcher.RestartSRT()
+		json.NewEncoder(w).Encode(map[string]string{"status": "SRT restart requested"})
+	case "restart-fallback":
+		s.switcher.RestartFallback()
+		json.NewEncoder(w).Encode(map[string]string{"status": "Fallback restart requested"})
+	case "restart-outputs":
+		s.outputManager.RestartAll()
+		json.NewEncoder(w).Encode(map[string]string{"status": "All outputs restarted"})
+	case "restart-all":
+		s.switcher.RestartSRT()
+		s.switcher.RestartFallback()
+		s.outputManager.RestartAll()
+		json.NewEncoder(w).Encode(map[string]string{"status": "Full restart requested"})
+	default:
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{"error": "unknown action"})
+	}
+}
+
+// ─── History ───
+
+func (s *APIServer) handleHistory(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"events": s.switcher.GetSwitchHistory()})
+}
+
+// ─── Recording ───
+
+func (s *APIServer) handleRecording(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	switch r.Method {
+	case http.MethodGet:
+		json.NewEncoder(w).Encode(s.recorder.GetStatus())
+	case http.MethodPost:
+		action := r.URL.Query().Get("action")
+		switch action {
+		case "start":
+			if err := s.recorder.Start(); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]string{"status": "recording started"})
+		case "stop":
+			if err := s.recorder.Stop(); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]string{"status": "recording stopped"})
+		default:
+			http.Error(w, "use ?action=start or ?action=stop", http.StatusBadRequest)
+		}
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *APIServer) handleRecordings(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"recordings": s.recorder.ListRecordings()})
+}
+
+func (s *APIServer) handleRecordingAction(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	name := r.URL.Path[len("/api/recordings/"):]
+
+	switch r.Method {
+	case http.MethodGet:
+		// Download file
+		filePath := filepath.Join(s.recorder.recordDir, name)
+		if _, err := os.Stat(filePath); os.IsNotExist(err) {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", name))
+		w.Header().Set("Content-Type", "video/mp4")
+		http.ServeFile(w, r, filePath)
+
+	case http.MethodDelete:
+		// Delete file
+		filePath := filepath.Join(s.recorder.recordDir, name)
+		if err := os.Remove(filePath); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]string{"status": "deleted"})
+
+	case http.MethodPut:
+		// Rename file
+		var body struct {
+			NewName string `json:"new_name"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.NewName == "" {
+			http.Error(w, "provide new_name", http.StatusBadRequest)
+			return
+		}
+		oldPath := filepath.Join(s.recorder.recordDir, name)
+		newPath := filepath.Join(s.recorder.recordDir, body.NewName)
+		if err := os.Rename(oldPath, newPath); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]string{"status": "renamed"})
 
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
-// WebSocket handler for real-time stats
+// ─── WebSocket ───
+
 func (s *APIServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("[server] WebSocket upgrade error: %v", err)
 		return
 	}
-
 	s.clientsMu.Lock()
 	s.clients[conn] = true
 	s.clientsMu.Unlock()
-
-	log.Printf("[server] WebSocket client connected (%d total)", len(s.clients))
-
-	// Read loop (handles pings and close)
 	go func() {
 		defer func() {
 			s.clientsMu.Lock()
 			delete(s.clients, conn)
 			s.clientsMu.Unlock()
 			conn.Close()
-			log.Printf("[server] WebSocket client disconnected")
 		}()
-
 		for {
-			_, _, err := conn.ReadMessage()
-			if err != nil {
+			if _, _, err := conn.ReadMessage(); err != nil {
 				return
 			}
 		}
 	}()
 }
 
-// broadcastLoop sends status updates to all WebSocket clients every second
 func (s *APIServer) broadcastLoop() {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
-
 	for range ticker.C {
 		s.clientsMu.Lock()
 		if len(s.clients) == 0 {
 			s.clientsMu.Unlock()
 			continue
 		}
-
 		resp := StatusResponse{
-			System:   s.sysStats.GetStats(),
-			Switcher: s.switcher.GetStats(),
-			Outputs:  s.outputManager.GetStats(),
+			System:    s.sysStats.GetStats(),
+			Switcher:  s.switcher.GetStats(),
+			Outputs:   s.outputManager.GetStats(),
+			Audio:     s.audioMeter.GetLevels(),
+			Recording: s.recorder.GetStatus(),
 		}
-
 		data, err := json.Marshal(resp)
 		if err != nil {
 			s.clientsMu.Unlock()
 			continue
 		}
-
 		for conn := range s.clients {
-			err := conn.WriteMessage(websocket.TextMessage, data)
-			if err != nil {
+			if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
 				conn.Close()
 				delete(s.clients, conn)
 			}
@@ -304,31 +396,25 @@ func (s *APIServer) broadcastLoop() {
 	}
 }
 
+// ─── Uploads ───
+
 func (s *APIServer) handleUploadFallback(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-
-	err := r.ParseMultipartForm(50 << 20) // 50 MB max
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
+	r.ParseMultipartForm(50 << 20)
 	file, handler, err := r.FormFile("file")
 	if err != nil {
 		http.Error(w, "Error retrieving file", http.StatusBadRequest)
 		return
 	}
 	defer file.Close()
-
 	ext := strings.ToLower(filepath.Ext(handler.Filename))
 	if ext != ".jpg" && ext != ".jpeg" && ext != ".png" && ext != ".ts" && ext != ".mp4" {
-		http.Error(w, "Invalid file type. Only JPG, PNG, TS, MP4 allowed.", http.StatusBadRequest)
+		http.Error(w, "Invalid file type", http.StatusBadRequest)
 		return
 	}
-
 	destPath := filepath.Join(s.dataDir, "fallback"+ext)
 	dest, err := os.Create(destPath)
 	if err != nil {
@@ -336,17 +422,10 @@ func (s *APIServer) handleUploadFallback(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	defer dest.Close()
-
-	if _, err := io.Copy(dest, file); err != nil {
-		http.Error(w, "Error saving file", http.StatusInternalServerError)
-		return
-	}
-
-	// Update switcher's fallback path dynamically
+	io.Copy(dest, file)
 	s.switcher.UpdateFallbackPath(destPath)
-
+	s.switcher.RestartFallback()
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(`{"success":true}`))
 }
 
@@ -355,26 +434,17 @@ func (s *APIServer) handleUploadWatermark(w http.ResponseWriter, r *http.Request
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-
-	err := r.ParseMultipartForm(10 << 20) // 10 MB max
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
+	r.ParseMultipartForm(10 << 20)
 	file, handler, err := r.FormFile("file")
 	if err != nil {
 		http.Error(w, "Error retrieving file", http.StatusBadRequest)
 		return
 	}
 	defer file.Close()
-
-	ext := strings.ToLower(filepath.Ext(handler.Filename))
-	if ext != ".png" {
-		http.Error(w, "Watermark must be a PNG file", http.StatusBadRequest)
+	if strings.ToLower(filepath.Ext(handler.Filename)) != ".png" {
+		http.Error(w, "Watermark must be PNG", http.StatusBadRequest)
 		return
 	}
-
 	destPath := filepath.Join(s.dataDir, "watermark.png")
 	dest, err := os.Create(destPath)
 	if err != nil {
@@ -382,22 +452,16 @@ func (s *APIServer) handleUploadWatermark(w http.ResponseWriter, r *http.Request
 		return
 	}
 	defer dest.Close()
-
-	if _, err := io.Copy(dest, file); err != nil {
-		http.Error(w, "Error saving file", http.StatusInternalServerError)
-		return
-	}
-
+	io.Copy(dest, file)
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(`{"success":true}`))
 }
 
-// GET /api/preview/frame — returns latest JPEG frame
+// ─── Preview ───
+
 func (s *APIServer) handlePreviewFrame(w http.ResponseWriter, r *http.Request) {
 	frame := s.preview.GetFrame()
 	if frame == nil {
-		// Return a 1x1 transparent pixel as placeholder
 		w.Header().Set("Content-Type", "image/jpeg")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.WriteHeader(http.StatusOK)
@@ -408,24 +472,18 @@ func (s *APIServer) handlePreviewFrame(w http.ResponseWriter, r *http.Request) {
 	w.Write(frame)
 }
 
-// GET/PUT /api/preview/settings — manage preview FPS and resolution
 func (s *APIServer) handlePreviewSettings(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-
 	switch r.Method {
 	case http.MethodGet:
 		fps, width, height := s.preview.GetSettings()
-		json.NewEncoder(w).Encode(map[string]int{
-			"fps": fps, "width": width, "height": height,
-		})
-
+		json.NewEncoder(w).Encode(map[string]int{"fps": fps, "width": width, "height": height})
 	case http.MethodPut:
 		fps, _ := strconv.Atoi(r.URL.Query().Get("fps"))
 		width, _ := strconv.Atoi(r.URL.Query().Get("w"))
 		height, _ := strconv.Atoi(r.URL.Query().Get("h"))
-
-		if fps <= 0 {
-			fps = 2
+		if fps < 0 {
+			fps = 0
 		}
 		if width <= 0 {
 			width = 640
@@ -433,10 +491,8 @@ func (s *APIServer) handlePreviewSettings(w http.ResponseWriter, r *http.Request
 		if height <= 0 {
 			height = 360
 		}
-
 		s.preview.UpdateSettings(fps, width, height)
 		json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
-
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}

@@ -146,11 +146,15 @@ func (p *PreviewManager) runPreviewProcess(fps, width, height, quality int) {
 
 	args := []string{
 		"-hide_banner", "-loglevel", "error",
+		"-fflags", "+genpts+discardcorrupt",
+		"-analyzeduration", "2000000",
+		"-probesize", "1000000",
 		"-f", "mpegts",
 		"-i", "pipe:0",
 		"-vf", fmt.Sprintf("scale=%d:%d", width, height),
 		"-r", fmt.Sprintf("%d", fps),
 		"-q:v", fmt.Sprintf("%d", quality),
+		"-an",
 		"-f", "image2pipe",
 		"-vcodec", "mjpeg",
 		"pipe:1",

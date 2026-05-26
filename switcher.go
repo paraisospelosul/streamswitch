@@ -21,9 +21,8 @@ import (
 type SwitcherState int
 
 const (
-	StateLive        SwitcherState = iota // SRT active, forwarding SRT data
-	StateFallback                         // SRT down, forwarding fallback data
-	StateSRTStarting                      // SRT process restarting, waiting for keyframe
+	StateLive      SwitcherState = iota
+	StateFallback
 )
 
 func (s SwitcherState) String() string {
@@ -31,15 +30,13 @@ func (s SwitcherState) String() string {
 	case StateLive:
 		return "live"
 	case StateFallback:
-		return "fallback"
-	case StateSRTStarting:
-		return "srt_starting"
+		return "backup"
 	default:
 		return "unknown"
 	}
 }
 
-// SwitcherConfig holds dynamic configuration that can be changed via the web UI
+// SwitcherConfig holds dynamic configuration
 type SwitcherConfig struct {
 	SRTAddr                  string `json:"srt_addr"`
 	SRTMode                  string `json:"srt_mode"`
@@ -50,20 +47,30 @@ type SwitcherConfig struct {
 	BitrateHysteresisSeconds int    `json:"bitrate_hysteresis_seconds"`
 }
 
+// SwitchEvent records a state transition
+type SwitchEvent struct {
+	Time   string `json:"time"`
+	From   string `json:"from"`
+	To     string `json:"to"`
+	Reason string `json:"reason"`
+}
+
 // SwitcherStats holds real-time statistics
 type SwitcherStats struct {
-	State             string  `json:"state"`
-	SRTConnected      bool    `json:"srt_connected"`
-	InputBitrateKbps  float64 `json:"input_bitrate_kbps"`
-	PacketsReceived   uint64  `json:"packets_received"`
-	PacketsForwarded  uint64  `json:"packets_forwarded"`
-	BytesReceived     uint64  `json:"bytes_received"`
-	KeyframesDetected uint64  `json:"keyframes_detected"`
-	SwitchCount       uint64  `json:"switch_count"`
-	LastSwitchTime    string  `json:"last_switch_time"`
-	Uptime            string  `json:"uptime"`
-	VideoPID          uint16  `json:"video_pid"`
-	AudioPID          uint16  `json:"audio_pid"`
+	State             string        `json:"state"`
+	SRTConnected      bool          `json:"srt_connected"`
+	InputBitrateKbps  float64       `json:"input_bitrate_kbps"`
+	PacketsReceived   uint64        `json:"packets_received"`
+	PacketsForwarded  uint64        `json:"packets_forwarded"`
+	BytesReceived     uint64        `json:"bytes_received"`
+	KeyframesDetected uint64        `json:"keyframes_detected"`
+	SwitchCount       uint64        `json:"switch_count"`
+	LastSwitchTime    string        `json:"last_switch_time"`
+	Uptime            string        `json:"uptime"`
+	VideoPID          uint16        `json:"video_pid"`
+	AudioPID          uint16        `json:"audio_pid"`
+	BitrateHistory    []float64     `json:"bitrate_history"`
+	RecentEvents      []SwitchEvent `json:"recent_events"`
 }
 
 // Broadcaster distributes MPEGTS packets to multiple subscribers
@@ -73,20 +80,17 @@ type Broadcaster struct {
 }
 
 func NewBroadcaster() *Broadcaster {
-	return &Broadcaster{
-		subscribers: make(map[string]chan []byte),
-	}
+	return &Broadcaster{subscribers: make(map[string]chan []byte)}
 }
 
 func (b *Broadcaster) Subscribe(id string) chan []byte {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	// If already subscribed, unsubscribe first to prevent double-close
 	if ch, ok := b.subscribers[id]; ok {
 		close(ch)
 		delete(b.subscribers, id)
 	}
-	ch := make(chan []byte, 50000) // Buffer 50000 packets (~9.4MB)
+	ch := make(chan []byte, 100000)
 	b.subscribers[id] = ch
 	return ch
 }
@@ -103,15 +107,13 @@ func (b *Broadcaster) Unsubscribe(id string) {
 func (b *Broadcaster) Broadcast(data []byte) {
 	buf := make([]byte, len(data))
 	copy(buf, data)
-
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-
 	for _, ch := range b.subscribers {
 		select {
 		case ch <- buf:
 		default:
-			// Subscriber too slow, drop packet
+			// Drop packet if subscriber is slow — prevent blocking
 		}
 	}
 }
@@ -134,90 +136,70 @@ type InputProcess struct {
 }
 
 func NewInputProcess(name string, args []string) *InputProcess {
-	return &InputProcess{
-		name: name,
-		args: args,
-	}
+	return &InputProcess{name: name, args: args}
 }
 
 func (ip *InputProcess) Start() error {
 	ip.mu.Lock()
 	defer ip.mu.Unlock()
-
 	ip.cmd = exec.Command("ffmpeg", ip.args...)
-	ip.cmd.SysProcAttr = &syscall.SysProcAttr{
-		Pdeathsig: syscall.SIGKILL,
-	}
+	ip.cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
 	var err error
-
 	ip.stdout, err = ip.cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("stdout pipe: %w", err)
 	}
-
 	ip.stderr, err = ip.cmd.StderrPipe()
 	if err != nil {
 		return fmt.Errorf("stderr pipe: %w", err)
 	}
-
 	if err := ip.cmd.Start(); err != nil {
 		return fmt.Errorf("start ffmpeg: %w", err)
 	}
-
 	ip.running.Store(true)
-
-	// Drain stderr in background
+	// Drain stderr to avoid blocking
 	go func() {
 		buf := make([]byte, 4096)
 		for {
-			_, err := ip.stderr.Read(buf)
-			if err != nil {
+			if _, err := ip.stderr.Read(buf); err != nil {
 				return
 			}
 		}
 	}()
-
-	log.Printf("[%s] FFmpeg process started (PID %d)", ip.name, ip.cmd.Process.Pid)
+	log.Printf("[%s] FFmpeg started (PID %d)", ip.name, ip.cmd.Process.Pid)
 	return nil
 }
 
 func (ip *InputProcess) Stop() {
 	ip.mu.Lock()
 	defer ip.mu.Unlock()
-
 	if ip.cmd != nil && ip.cmd.Process != nil {
 		ip.cmd.Process.Kill()
 		ip.cmd.Wait()
 	}
 	ip.running.Store(false)
-	log.Printf("[%s] FFmpeg process stopped", ip.name)
+	log.Printf("[%s] FFmpeg stopped", ip.name)
 }
 
-func (ip *InputProcess) IsRunning() bool {
-	return ip.running.Load()
-}
+func (ip *InputProcess) IsRunning() bool { return ip.running.Load() }
 
-// Switcher is the core engine that switches between SRT input and fallback
+// Switcher is the core engine
 type Switcher struct {
-	// Configuration (dynamic, editable via web UI)
 	config     SwitcherConfig
 	configMu   sync.RWMutex
 	configPath string
-
 	srtEnabled atomic.Bool
 
-	// State
 	state   SwitcherState
 	stateMu sync.RWMutex
-
 	startTime time.Time
 
-	// MPEGTS state
+	// MPEGTS PIDs
 	videoPID uint16
 	audioPID uint16
 	pmtPID   uint16
 
-	// Statistics (atomic for lock-free reads)
+	// Stats
 	packetsReceived   atomic.Uint64
 	packetsForwarded  atomic.Uint64
 	bytesReceived     atomic.Uint64
@@ -226,19 +208,31 @@ type Switcher struct {
 	lastSwitchTime    time.Time
 	lastSwitchTimeMu  sync.RWMutex
 
-	// Bitrate tracking
+	// Bitrate
 	bitrateBytes       atomic.Uint64
 	currentBitrateKbps atomic.Uint64
 
-	// Bitrate threshold tracking
+	// Bitrate threshold
 	lowBitrateStart time.Time
 	inLowBitrate    bool
 
+	// Bitrate history ring buffer (300 = 5min at 1/sec)
+	bitrateHistory    [300]float64
+	bitrateHistoryIdx int
+	bitrateHistoryLen int
+	bitrateHistoryMu  sync.RWMutex
+
+	// Switch event history (last 100)
+	switchEvents   []SwitchEvent
+	switchEventsMu sync.RWMutex
+
+	// Restart channels (quick action buttons)
+	restartSRTCh      chan struct{}
+	restartFallbackCh chan struct{}
+
 	// Output distribution
 	broadcaster *Broadcaster
-
-	// General
-	dataDir string
+	dataDir     string
 }
 
 func NewSwitcher(srtAddr, srtMode, fallbackPath string, timeoutMs int, statsURL string, dataDir string, configPath string) *Switcher {
@@ -249,20 +243,38 @@ func NewSwitcher(srtAddr, srtMode, fallbackPath string, timeoutMs int, statsURL 
 			FallbackPath:             fallbackPath,
 			SRTTimeout:               timeoutMs,
 			StatsURL:                 statsURL,
-			MinBitrateKbps:           0, // disabled by default
+			MinBitrateKbps:           0,
 			BitrateHysteresisSeconds: 5,
 		},
-		configPath:  configPath,
-		dataDir:     dataDir,
-		state:       StateFallback,
-		broadcaster: NewBroadcaster(),
+		configPath:        configPath,
+		dataDir:           dataDir,
+		state:             StateFallback,
+		broadcaster:       NewBroadcaster(),
+		switchEvents:      make([]SwitchEvent, 0, 100),
+		restartSRTCh:      make(chan struct{}, 1),
+		restartFallbackCh: make(chan struct{}, 1),
 	}
 	sw.srtEnabled.Store(true)
-
-	// Try to load saved config (overrides CLI flags)
 	sw.loadConfig()
-
 	return sw
+}
+
+// RestartSRT signals the SRT manager to kill and reconnect
+func (s *Switcher) RestartSRT() {
+	select {
+	case s.restartSRTCh <- struct{}{}:
+		log.Println("[switcher] SRT restart requested")
+	default:
+	}
+}
+
+// RestartFallback signals the fallback manager to restart
+func (s *Switcher) RestartFallback() {
+	select {
+	case s.restartFallbackCh <- struct{}{}:
+		log.Println("[switcher] Fallback restart requested")
+	default:
+	}
 }
 
 func (s *Switcher) GetConfig() SwitcherConfig {
@@ -276,8 +288,6 @@ func (s *Switcher) UpdateConfig(cfg SwitcherConfig) {
 	defer s.configMu.Unlock()
 	s.config = cfg
 	s.saveConfig()
-	log.Printf("[switcher] Config updated: SRT=%s mode=%s timeout=%d minBitrate=%d hysteresis=%d",
-		cfg.SRTAddr, cfg.SRTMode, cfg.SRTTimeout, cfg.MinBitrateKbps, cfg.BitrateHysteresisSeconds)
 }
 
 func (s *Switcher) UpdateFallbackPath(path string) {
@@ -285,28 +295,21 @@ func (s *Switcher) UpdateFallbackPath(path string) {
 	defer s.configMu.Unlock()
 	s.config.FallbackPath = path
 	s.saveConfig()
-	log.Printf("[switcher] Fallback path updated dynamically to: %s", path)
+	log.Printf("[switcher] Fallback path updated to: %s", path)
 }
 
 func (s *Switcher) saveConfig() {
-	data, err := json.MarshalIndent(s.config, "", "  ")
-	if err != nil {
-		log.Printf("[switcher] Failed to save config: %v", err)
-		return
-	}
-	if err := os.WriteFile(s.configPath, data, 0644); err != nil {
-		log.Printf("[switcher] Failed to write config file: %v", err)
-	}
+	data, _ := json.MarshalIndent(s.config, "", "  ")
+	os.WriteFile(s.configPath, data, 0644)
 }
 
 func (s *Switcher) loadConfig() {
 	data, err := os.ReadFile(s.configPath)
 	if err != nil {
-		return // File doesn't exist yet, use CLI defaults
+		return
 	}
 	var cfg SwitcherConfig
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		log.Printf("[switcher] Failed to parse config: %v", err)
 		return
 	}
 	s.config = cfg
@@ -319,19 +322,56 @@ func (s *Switcher) GetState() SwitcherState {
 	return s.state
 }
 
-func (s *Switcher) setState(state SwitcherState) {
+func (s *Switcher) setStateWithReason(state SwitcherState, reason string) {
 	s.stateMu.Lock()
-	defer s.stateMu.Unlock()
-	if s.state != state {
-		log.Printf("[switcher] State change: %s -> %s", s.state, state)
-		s.state = state
-		if state == StateLive || state == StateFallback {
-			s.switchCount.Add(1)
-			s.lastSwitchTimeMu.Lock()
-			s.lastSwitchTime = time.Now()
-			s.lastSwitchTimeMu.Unlock()
-		}
+	oldState := s.state
+	if oldState == state {
+		s.stateMu.Unlock()
+		return
 	}
+	s.state = state
+	s.stateMu.Unlock()
+
+	log.Printf("[switcher] %s -> %s (%s)", oldState, state, reason)
+	s.switchCount.Add(1)
+	s.lastSwitchTimeMu.Lock()
+	s.lastSwitchTime = time.Now()
+	s.lastSwitchTimeMu.Unlock()
+
+	event := SwitchEvent{
+		Time:   time.Now().Format(time.RFC3339),
+		From:   oldState.String(),
+		To:     state.String(),
+		Reason: reason,
+	}
+	s.switchEventsMu.Lock()
+	s.switchEvents = append(s.switchEvents, event)
+	if len(s.switchEvents) > 100 {
+		s.switchEvents = s.switchEvents[len(s.switchEvents)-100:]
+	}
+	s.switchEventsMu.Unlock()
+}
+
+func (s *Switcher) GetSwitchHistory() []SwitchEvent {
+	s.switchEventsMu.RLock()
+	defer s.switchEventsMu.RUnlock()
+	events := make([]SwitchEvent, len(s.switchEvents))
+	copy(events, s.switchEvents)
+	return events
+}
+
+func (s *Switcher) getBitrateHistory() []float64 {
+	s.bitrateHistoryMu.RLock()
+	defer s.bitrateHistoryMu.RUnlock()
+	result := make([]float64, s.bitrateHistoryLen)
+	if s.bitrateHistoryLen == 0 {
+		return result
+	}
+	start := (s.bitrateHistoryIdx - s.bitrateHistoryLen + 300) % 300
+	for i := 0; i < s.bitrateHistoryLen; i++ {
+		result[i] = s.bitrateHistory[(start+i)%300]
+	}
+	return result
 }
 
 func (s *Switcher) GetStats() SwitcherStats {
@@ -343,11 +383,21 @@ func (s *Switcher) GetStats() SwitcherStats {
 	if !lastSwitch.IsZero() {
 		lastSwitchStr = lastSwitch.Format(time.RFC3339)
 	}
-
 	uptimeStr := ""
 	if !s.startTime.IsZero() {
 		uptimeStr = time.Since(s.startTime).Truncate(time.Second).String()
 	}
+
+	s.switchEventsMu.RLock()
+	recentCount := len(s.switchEvents)
+	if recentCount > 10 {
+		recentCount = 10
+	}
+	recentEvents := make([]SwitchEvent, recentCount)
+	if recentCount > 0 {
+		copy(recentEvents, s.switchEvents[len(s.switchEvents)-recentCount:])
+	}
+	s.switchEventsMu.RUnlock()
 
 	return SwitcherStats{
 		State:             s.GetState().String(),
@@ -362,6 +412,8 @@ func (s *Switcher) GetStats() SwitcherStats {
 		Uptime:            uptimeStr,
 		VideoPID:          s.videoPID,
 		AudioPID:          s.audioPID,
+		BitrateHistory:    s.getBitrateHistory(),
+		RecentEvents:      recentEvents,
 	}
 }
 
@@ -395,32 +447,23 @@ func (s *Switcher) buildFallbackArgs() []string {
 	if ext == ".jpg" || ext == ".jpeg" || ext == ".png" {
 		return []string{
 			"-hide_banner", "-loglevel", "error",
-			"-loop", "1",
-			"-re",
-			"-framerate", "30",
+			"-loop", "1", "-re", "-framerate", "30",
 			"-i", fallbackPath,
-			"-f", "lavfi",
-			"-i", "anullsrc=r=48000:cl=stereo", // Generate silent audio
-			"-c:v", "libx265",
-			"-preset", "ultrafast",
+			"-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+			"-c:v", "libx265", "-preset", "ultrafast",
 			"-x265-params", "keyint=60:min-keyint=60",
 			"-pix_fmt", "yuv420p",
-			"-c:a", "aac",
-			"-b:a", "128k",
-			"-f", "mpegts",
-			"-flush_packets", "1",
+			"-c:a", "aac", "-b:a", "128k",
+			"-f", "mpegts", "-flush_packets", "1",
 			"pipe:1",
 		}
 	}
-
 	return []string{
 		"-hide_banner", "-loglevel", "error",
-		"-re",
-		"-stream_loop", "-1",
+		"-re", "-stream_loop", "-1",
 		"-i", fallbackPath,
 		"-c", "copy",
-		"-f", "mpegts",
-		"-flush_packets", "1",
+		"-f", "mpegts", "-flush_packets", "1",
 		"pipe:1",
 	}
 }
@@ -429,14 +472,12 @@ func (s *Switcher) statsPoller(ctx context.Context, forceFallbackCh chan struct{
 	s.configMu.RLock()
 	statsURL := s.config.StatsURL
 	s.configMu.RUnlock()
-
 	if statsURL == "" {
 		return
 	}
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 	client := &http.Client{Timeout: 2 * time.Second}
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -445,22 +486,18 @@ func (s *Switcher) statsPoller(ctx context.Context, forceFallbackCh chan struct{
 			s.configMu.RLock()
 			url := s.config.StatsURL
 			s.configMu.RUnlock()
-
 			if url == "" {
 				continue
 			}
-
 			resp, err := client.Get(url)
 			if err != nil {
 				continue
 			}
-
 			var stats struct {
 				Publishers map[string]interface{} `json:"publishers"`
 			}
 			if err := json.NewDecoder(resp.Body).Decode(&stats); err == nil {
 				if len(stats.Publishers) == 0 {
-					// No publishers, force fallback and disable SRT connection
 					s.srtEnabled.Store(false)
 					select {
 					case forceFallbackCh <- struct{}{}:
@@ -475,62 +512,47 @@ func (s *Switcher) statsPoller(ctx context.Context, forceFallbackCh chan struct{
 	}
 }
 
-// checkBitrateThreshold checks if bitrate is below minimum and returns true if fallback should be triggered
 func (s *Switcher) checkBitrateThreshold() bool {
 	s.configMu.RLock()
 	minBitrate := s.config.MinBitrateKbps
 	hysteresis := s.config.BitrateHysteresisSeconds
 	s.configMu.RUnlock()
-
 	if minBitrate <= 0 {
-		return false // Disabled
+		return false
 	}
-
 	currentBitrate := s.currentBitrateKbps.Load()
 	if currentBitrate > 0 && int(currentBitrate) < minBitrate {
 		if !s.inLowBitrate {
 			s.inLowBitrate = true
 			s.lowBitrateStart = time.Now()
-			log.Printf("[switcher] Bitrate dropped below minimum (%d < %d kbps), starting hysteresis timer (%ds)", currentBitrate, minBitrate, hysteresis)
 		} else if time.Since(s.lowBitrateStart) >= time.Duration(hysteresis)*time.Second {
-			log.Printf("[switcher] Bitrate below minimum for %ds, triggering fallback", hysteresis)
 			s.inLowBitrate = false
 			return true
 		}
 	} else {
-		if s.inLowBitrate {
-			log.Printf("[switcher] Bitrate recovered above minimum (%d kbps)", currentBitrate)
-		}
 		s.inLowBitrate = false
 	}
 	return false
 }
 
-// Run starts the switcher main loop
 func (s *Switcher) Run(ctx context.Context) error {
 	s.startTime = time.Now()
 	log.Println("[switcher] Starting...")
 
-	// Start bitrate calculator
 	go s.bitrateLoop(ctx)
 
-	// Start fallback FFmpeg (always running, with auto-restart)
-	fallbackDataCh := make(chan []byte, 10000)
+	// Fallback always runs — provides instant data when SRT drops
+	fallbackDataCh := make(chan []byte, 50000)
 	go s.fallbackManagerLoop(ctx, fallbackDataCh)
 
-	// Channels for reading data from both sources
-	srtDataCh := make(chan []byte, 10000)
+	srtDataCh := make(chan []byte, 50000)
 	srtDiedCh := make(chan struct{}, 1)
 	forceFallbackCh := make(chan struct{}, 1)
 
-	// Start HTTP poller
 	go s.statsPoller(ctx, forceFallbackCh)
-
-	// Start SRT process and reader
 	go s.srtManagerLoop(ctx, srtDataCh, srtDiedCh)
 
-	// Start in fallback state
-	s.setState(StateFallback)
+	s.setStateWithReason(StateFallback, "startup")
 
 	s.configMu.RLock()
 	timeoutDuration := time.Duration(s.config.SRTTimeout) * time.Millisecond
@@ -539,24 +561,20 @@ func (s *Switcher) Run(ctx context.Context) error {
 	timeout := time.NewTimer(timeoutDuration)
 	defer timeout.Stop()
 
-	// Bitrate check ticker (every second)
 	bitrateCheckTicker := time.NewTicker(1 * time.Second)
 	defer bitrateCheckTicker.Stop()
 
 	for {
 		currentState := s.GetState()
-
 		switch currentState {
 		case StateLive:
 			select {
 			case data, ok := <-srtDataCh:
 				if !ok {
-					log.Println("[switcher] SRT channel closed, exiting")
 					return nil
 				}
 				s.processPackets(data)
 				if info, ok := ParseTSPacket(data); ok {
-					// Only reset timeout if it's a video packet
 					if s.videoPID == 0 || info.PID == s.videoPID {
 						s.configMu.RLock()
 						td := time.Duration(s.config.SRTTimeout) * time.Millisecond
@@ -566,60 +584,44 @@ func (s *Switcher) Run(ctx context.Context) error {
 				}
 				s.broadcaster.Broadcast(data)
 				s.packetsForwarded.Add(1)
-
 			case <-timeout.C:
-				log.Println("[switcher] SRT timeout, switching to fallback")
-				s.setState(StateFallback)
-
+				s.setStateWithReason(StateFallback, "SRT timeout")
 			case <-bitrateCheckTicker.C:
 				if s.checkBitrateThreshold() {
-					s.setState(StateFallback)
+					s.setStateWithReason(StateFallback, "bitrate below minimum")
 				}
-
 			case <-forceFallbackCh:
-				log.Println("[switcher] API reported no publishers, forcing fallback")
-				s.setState(StateFallback)
-
+				s.setStateWithReason(StateFallback, "no publishers (API)")
 			case <-srtDiedCh:
-				log.Println("[switcher] SRT process died, switching to fallback")
-				s.setState(StateFallback)
-
+				s.setStateWithReason(StateFallback, "SRT process died")
 			case <-ctx.Done():
 				return nil
 			}
 
-		case StateFallback, StateSRTStarting:
+		case StateFallback:
 			select {
 			case data := <-fallbackDataCh:
 				s.broadcaster.Broadcast(data)
 				s.packetsForwarded.Add(1)
-
 			case data, ok := <-srtDataCh:
 				if ok {
-					// Check if this contains a keyframe
 					if s.containsKeyframe(data) {
-						log.Println("[switcher] SRT keyframe detected, switching to LIVE")
-						s.setState(StateLive)
-
+						s.setStateWithReason(StateLive, "SRT keyframe detected")
 						s.configMu.RLock()
 						td := time.Duration(s.config.SRTTimeout) * time.Millisecond
 						s.configMu.RUnlock()
-
 						timeout.Reset(td)
 						s.processPackets(data)
 						s.broadcaster.Broadcast(data)
 						s.packetsForwarded.Add(1)
 					} else {
-						s.setState(StateSRTStarting)
+						// SRT data but no keyframe yet — stay in backup silently
 					}
 				}
-
 			case <-forceFallbackCh:
-				s.setState(StateFallback)
-
+				// Stay in fallback
 			case <-srtDiedCh:
-				// SRT still down, waiting for reconnection
-
+				// SRT still down
 			case <-ctx.Done():
 				return nil
 			}
@@ -627,7 +629,6 @@ func (s *Switcher) Run(ctx context.Context) error {
 	}
 }
 
-// fallbackManagerLoop manages the fallback FFmpeg process with auto-restart
 func (s *Switcher) fallbackManagerLoop(ctx context.Context, dataCh chan []byte) {
 	for {
 		select {
@@ -636,10 +637,7 @@ func (s *Switcher) fallbackManagerLoop(ctx context.Context, dataCh chan []byte) 
 		default:
 		}
 
-		s.configMu.RLock()
 		args := s.buildFallbackArgs()
-		s.configMu.RUnlock()
-
 		fallbackProc := NewInputProcess("fallback", args)
 		if err := fallbackProc.Start(); err != nil {
 			log.Printf("[switcher] Fallback start failed: %v, retrying in 3s", err)
@@ -651,22 +649,29 @@ func (s *Switcher) fallbackManagerLoop(ctx context.Context, dataCh chan []byte) 
 			}
 		}
 
-		// Read loop — exits when FFmpeg dies
 		procDiedCh := make(chan struct{}, 1)
-		s.readInputLoop(ctx, fallbackProc, dataCh, procDiedCh, true)
-
-		fallbackProc.Stop()
-		log.Println("[switcher] Fallback process died, restarting in 2s...")
+		go s.readInputLoop(ctx, fallbackProc, dataCh, procDiedCh, true)
 
 		select {
-		case <-time.After(2 * time.Second):
+		case <-procDiedCh:
+			fallbackProc.Stop()
+			log.Println("[switcher] Fallback died, restarting in 2s...")
+		case <-s.restartFallbackCh:
+			fallbackProc.Stop()
+			log.Println("[switcher] Fallback restart requested")
+		case <-ctx.Done():
+			fallbackProc.Stop()
+			return
+		}
+
+		select {
+		case <-time.After(1 * time.Second):
 		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-// srtManagerLoop manages the SRT FFmpeg process lifecycle with reconnection
 func (s *Switcher) srtManagerLoop(ctx context.Context, dataCh chan []byte, diedCh chan struct{}) {
 	for {
 		select {
@@ -675,7 +680,6 @@ func (s *Switcher) srtManagerLoop(ctx context.Context, dataCh chan []byte, diedC
 		default:
 		}
 
-		// Wait until SRT is enabled
 		for !s.srtEnabled.Load() {
 			select {
 			case <-time.After(1 * time.Second):
@@ -695,42 +699,23 @@ func (s *Switcher) srtManagerLoop(ctx context.Context, dataCh chan []byte, diedC
 			}
 		}
 
-		// Watchdog to kill proc if disabled
-		watchdogDone := make(chan struct{})
-		go func() {
-			for {
-				select {
-				case <-watchdogDone:
-					return
-				case <-time.After(1 * time.Second):
-					if !s.srtEnabled.Load() {
-						log.Println("[switcher] SRT disabled by API, disconnecting...")
-						newProc.Stop()
-						return
-					}
-				}
-			}
-		}()
-
-		// Read loop
 		procDiedCh := make(chan struct{}, 1)
 		go s.readInputLoop(ctx, newProc, dataCh, procDiedCh, false)
 
 		select {
 		case <-procDiedCh:
+		case <-s.restartSRTCh:
 		case <-ctx.Done():
+			newProc.Stop()
 			return
 		}
 
-		close(watchdogDone)
 		newProc.Stop()
-
 		select {
 		case diedCh <- struct{}{}:
 		default:
 		}
 
-		// Wait before reconnecting
 		select {
 		case <-time.After(2 * time.Second):
 		case <-ctx.Done():
@@ -739,22 +724,18 @@ func (s *Switcher) srtManagerLoop(ctx context.Context, dataCh chan []byte, diedC
 	}
 }
 
-// readInputLoop reads MPEGTS data from an input process and sends to channel
 func (s *Switcher) readInputLoop(ctx context.Context, proc *InputProcess, dataCh chan []byte, diedCh chan struct{}, throttle bool) {
 	aligner := NewPacketAligner()
 	readBuf := make([]byte, 1316*7)
-
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
 		}
-
 		startTime := time.Now()
 		n, err := proc.stdout.Read(readBuf)
 		if err != nil {
-			log.Printf("[%s] read error: %v", proc.name, err)
 			if diedCh != nil {
 				select {
 				case diedCh <- struct{}{}:
@@ -763,14 +744,12 @@ func (s *Switcher) readInputLoop(ctx context.Context, proc *InputProcess, dataCh
 			}
 			return
 		}
-
 		if throttle {
 			elapsed := time.Since(startTime)
 			if elapsed < 10*time.Millisecond {
 				time.Sleep(10*time.Millisecond - elapsed)
 			}
 		}
-
 		if n > 0 {
 			if !throttle {
 				s.packetsReceived.Add(1)
@@ -793,57 +772,45 @@ func (s *Switcher) readInputLoop(ctx context.Context, proc *InputProcess, dataCh
 	}
 }
 
-// processPackets inspects MPEGTS packets for PAT/PMT to discover PIDs
 func (s *Switcher) processPackets(data []byte) {
 	if len(data) < tsPacketSize {
 		return
 	}
-
 	info, ok := ParseTSPacket(data)
 	if !ok {
 		return
 	}
-
-	// Parse PAT to find PMT PID
 	if info.PID == patPID && info.PUSI && info.HasPayload {
 		if pmtPID := ParsePAT(data[info.PayloadOffset:]); pmtPID != 0 {
 			s.pmtPID = pmtPID
 		}
 	}
-
-	// Parse PMT to find video/audio PIDs
 	if info.PID == s.pmtPID && s.pmtPID != 0 && info.PUSI && info.HasPayload {
 		vPID, aPID := ParsePMT(data[info.PayloadOffset:])
 		if vPID != 0 {
 			if s.videoPID != vPID {
-				log.Printf("[switcher] Video PID detected: %d", vPID)
+				log.Printf("[switcher] Video PID: %d", vPID)
 			}
 			s.videoPID = vPID
 		}
 		if aPID != 0 {
 			if s.audioPID != aPID {
-				log.Printf("[switcher] Audio PID detected: %d", aPID)
+				log.Printf("[switcher] Audio PID: %d", aPID)
 			}
 			s.audioPID = aPID
 		}
 	}
 }
 
-// containsKeyframe checks if a packet contains an H.265 keyframe
 func (s *Switcher) containsKeyframe(data []byte) bool {
 	if len(data) < tsPacketSize {
 		return false
 	}
-
 	info, ok := ParseTSPacket(data)
 	if !ok {
 		return false
 	}
-
-	// First, learn PIDs from PAT/PMT
 	s.processPackets(data)
-
-	// Check for keyframe in video packets
 	if info.PID == s.videoPID && s.videoPID != 0 && info.PUSI && info.HasPayload {
 		pesPayload := ExtractPESPayload(data, info.PayloadOffset)
 		if pesPayload != nil && IsKeyframe(pesPayload) {
@@ -851,22 +818,25 @@ func (s *Switcher) containsKeyframe(data []byte) bool {
 			return true
 		}
 	}
-
 	return false
 }
 
-// bitrateLoop calculates input bitrate every second
 func (s *Switcher) bitrateLoop(ctx context.Context) {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ticker.C:
 			bytes := s.bitrateBytes.Swap(0)
 			kbps := (bytes * 8) / 1000
 			s.currentBitrateKbps.Store(kbps)
-
+			s.bitrateHistoryMu.Lock()
+			s.bitrateHistory[s.bitrateHistoryIdx] = float64(kbps)
+			s.bitrateHistoryIdx = (s.bitrateHistoryIdx + 1) % 300
+			if s.bitrateHistoryLen < 300 {
+				s.bitrateHistoryLen++
+			}
+			s.bitrateHistoryMu.Unlock()
 		case <-ctx.Done():
 			return
 		}

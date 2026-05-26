@@ -535,6 +535,20 @@ func (om *OutputManager) StopAll() {
 	}
 }
 
+func (om *OutputManager) RestartAll() {
+	om.mu.RLock()
+	defer om.mu.RUnlock()
+
+	for _, o := range om.outputs {
+		if o.targetRunning.Load() {
+			o.Stop(om.broadcaster)
+			time.Sleep(200 * time.Millisecond)
+			o.Start(om.broadcaster)
+		}
+	}
+	log.Printf("[outputs] All running outputs restarted")
+}
+
 // Config persistence
 type savedConfig struct {
 	Outputs []OutputConfig `json:"outputs"`

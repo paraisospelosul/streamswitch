@@ -1,9 +1,16 @@
-# Binários compilados
-
+# Binários
+streamswitch
+streamswitch_final
 *.exe
 
-# Mídia do usuário
+# Dados sensíveis
+.env
 
+# Mídia local
+fallback.*
+watermark.png
+queda.jpeg
+data/scenes/
 
 # Sistema
 .DS_Store
