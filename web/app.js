@@ -226,7 +226,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 document.getElementById('cfg-min-bitrate').value = cfg.min_bitrate_kbps || 0;
                 document.getElementById('cfg-hysteresis').value = cfg.bitrate_hysteresis_seconds || 5;
                 document.getElementById('cfg-stats-url').value = cfg.stats_url || '';
-                document.getElementById('cfg-fallback-path').textContent = cfg.fallback_path || '—';
+                document.getElementById('cfg-fallback-path').value = cfg.fallback_path || '';
             }
         } catch (e) { /* silent */ }
     }
@@ -237,7 +237,7 @@ document.addEventListener('DOMContentLoaded', () => {
             srt_mode: document.getElementById('cfg-srt-mode').value,
             srt_timeout: parseInt(document.getElementById('cfg-srt-timeout').value, 10),
             stats_url: document.getElementById('cfg-stats-url').value.trim(),
-            fallback_path: document.getElementById('cfg-fallback-path').textContent,
+            fallback_path: document.getElementById('cfg-fallback-path').value.trim(),
             min_bitrate_kbps: parseInt(document.getElementById('cfg-min-bitrate').value, 10) || 0,
             bitrate_hysteresis_seconds: parseInt(document.getElementById('cfg-hysteresis').value, 10) || 5,
         };
@@ -383,35 +383,44 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('btn-upload-watermark').addEventListener('click', () =>
         handleUpload('/api/upload/watermark', 'file-watermark', 'btn-upload-watermark'));
 
-    // ─── Preview ───
-    const previewIframe = document.getElementById('preview-iframe');
-    const previewOverlay = document.getElementById('preview-overlay');
-    const previewInput = document.getElementById('preview-url-input');
-    const btnEditPreview = document.getElementById('btn-edit-preview');
+    // ─── Preview (Snapshot) ───
+    const previewImg = document.getElementById('preview-snapshot');
+    let previewInterval = null;
+    let previewFps = 2;
 
-    const savedPreviewUrl = localStorage.getItem('streamswitch_preview_url');
-    if (savedPreviewUrl) {
-        previewInput.value = savedPreviewUrl;
-        previewIframe.src = savedPreviewUrl;
-        previewOverlay.classList.add('hidden');
-        btnEditPreview.style.display = 'inline-flex';
+    function stopPreviewRefresh() {
+        if (previewInterval) { clearInterval(previewInterval); previewInterval = null; }
+        previewImg.removeAttribute('src');
     }
 
-    document.getElementById('btn-save-preview').addEventListener('click', () => {
-        const url = previewInput.value.trim();
-        if (!url) { toast('Enter a URL', 'error'); return; }
-        localStorage.setItem('streamswitch_preview_url', url);
-        previewIframe.src = url;
-        previewOverlay.classList.add('hidden');
-        btnEditPreview.style.display = 'inline-flex';
-        toast('Preview URL saved', 'success');
+    function startPreviewRefresh() {
+        stopPreviewRefresh();
+        if (previewFps <= 0) return;
+        const ms = Math.max(200, Math.floor(1000 / previewFps));
+        previewImg.src = '/api/preview/frame?t=' + Date.now();
+        previewInterval = setInterval(() => {
+            previewImg.src = '/api/preview/frame?t=' + Date.now();
+        }, ms);
+    }
+
+    document.getElementById('btn-apply-preview').addEventListener('click', async () => {
+        const fps = parseInt(document.getElementById('preview-fps').value, 10);
+        const [w, h] = document.getElementById('preview-res').value.split('x').map(Number);
+        previewFps = fps;
+        try {
+            await fetch(`/api/preview/settings?fps=${fps}&w=${w}&h=${h}`, { method: 'PUT' });
+            if (fps === 0) {
+                stopPreviewRefresh();
+                toast('Preview desligado', 'info');
+            } else {
+                startPreviewRefresh();
+                toast(`Preview: ${fps}fps ${w}x${h}`, 'success');
+            }
+        } catch (e) { toast(`Error: ${e.message}`, 'error'); }
     });
 
-    btnEditPreview.addEventListener('click', () => {
-        previewOverlay.classList.remove('hidden');
-        btnEditPreview.style.display = 'none';
-        previewInput.focus();
-    });
+    // Start preview auto-refresh
+    startPreviewRefresh();
 
     // ─── Modal Helpers ───
     function openModal(modal) { modal.classList.add('open'); }

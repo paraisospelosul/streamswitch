@@ -105,7 +105,9 @@ Examples:
 
 	switcher := NewSwitcher(*srtAddr, *srtMode, *fallbackPath, *srtTimeout, *statsURL, *dataDir, switcherConfigPath)
 	outputManager := NewOutputManager(switcher.broadcaster, configPath, *dataDir)
-	apiServer := NewAPIServer(switcher, outputManager, sysStats, *dataDir, *webPort)
+	preview := NewPreviewManager(switcher.broadcaster)
+	go preview.Start()
+	apiServer := NewAPIServer(switcher, outputManager, sysStats, preview, *dataDir, *webPort)
 
 	// Start switcher in background
 	go func() {

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +26,7 @@ type APIServer struct {
 	switcher      *Switcher
 	outputManager *OutputManager
 	sysStats      *SysStatsMonitor
+	preview       *PreviewManager
 	dataDir       string
 	port          int
 
@@ -33,11 +35,12 @@ type APIServer struct {
 	clientsMu sync.Mutex
 }
 
-func NewAPIServer(switcher *Switcher, outputManager *OutputManager, sysStats *SysStatsMonitor, dataDir string, port int) *APIServer {
+func NewAPIServer(switcher *Switcher, outputManager *OutputManager, sysStats *SysStatsMonitor, preview *PreviewManager, dataDir string, port int) *APIServer {
 	return &APIServer{
 		switcher:      switcher,
 		outputManager: outputManager,
 		sysStats:      sysStats,
+		preview:       preview,
 		dataDir:       dataDir,
 		port:          port,
 		upgrader: websocket.Upgrader{
@@ -64,6 +67,8 @@ func (s *APIServer) Run() error {
 	mux.HandleFunc("/api/outputs/", s.handleOutputAction)
 	mux.HandleFunc("/api/upload/fallback", s.handleUploadFallback)
 	mux.HandleFunc("/api/upload/watermark", s.handleUploadWatermark)
+	mux.HandleFunc("/api/preview/frame", s.handlePreviewFrame)
+	mux.HandleFunc("/api/preview/settings", s.handlePreviewSettings)
 	mux.HandleFunc("/ws", s.handleWebSocket)
 
 	// Static files (embedded web UI)
@@ -386,4 +391,53 @@ func (s *APIServer) handleUploadWatermark(w http.ResponseWriter, r *http.Request
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(`{"success":true}`))
+}
+
+// GET /api/preview/frame — returns latest JPEG frame
+func (s *APIServer) handlePreviewFrame(w http.ResponseWriter, r *http.Request) {
+	frame := s.preview.GetFrame()
+	if frame == nil {
+		// Return a 1x1 transparent pixel as placeholder
+		w.Header().Set("Content-Type", "image/jpeg")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	w.Header().Set("Content-Type", "image/jpeg")
+	w.Header().Set("Cache-Control", "no-cache, no-store")
+	w.Write(frame)
+}
+
+// GET/PUT /api/preview/settings — manage preview FPS and resolution
+func (s *APIServer) handlePreviewSettings(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	switch r.Method {
+	case http.MethodGet:
+		fps, width, height := s.preview.GetSettings()
+		json.NewEncoder(w).Encode(map[string]int{
+			"fps": fps, "width": width, "height": height,
+		})
+
+	case http.MethodPut:
+		fps, _ := strconv.Atoi(r.URL.Query().Get("fps"))
+		width, _ := strconv.Atoi(r.URL.Query().Get("w"))
+		height, _ := strconv.Atoi(r.URL.Query().Get("h"))
+
+		if fps <= 0 {
+			fps = 2
+		}
+		if width <= 0 {
+			width = 640
+		}
+		if height <= 0 {
+			height = 360
+		}
+
+		s.preview.UpdateSettings(fps, width, height)
+		json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
 }

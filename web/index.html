@@ -72,8 +72,8 @@
                             </div>
                         </div>
                         <div class="form-group" style="margin-top:0.5rem;">
-                            <label>Fallback Path</label>
-                            <div class="readonly-field" id="cfg-fallback-path">—</div>
+                            <label for="cfg-fallback-path">Fallback Path <small>(file on the VPS)</small></label>
+                            <input type="text" id="cfg-fallback-path" placeholder="/opt/streamswitch/scripts/queda.jpeg">
                         </div>
                         <button class="btn btn-primary" id="btn-save-config" style="margin-top:1rem;">Save Configuration</button>
                     </div>
@@ -117,17 +117,26 @@
                 <div class="card">
                     <div class="card-header">
                         <h2>Live Preview</h2>
-                        <button class="btn btn-sm btn-secondary" id="btn-edit-preview" style="display:none;">Edit URL</button>
+                        <div class="preview-controls">
+                            <select id="preview-fps" class="select-sm">
+                                <option value="0">Off</option>
+                                <option value="1">1 fps</option>
+                                <option value="2" selected>2 fps</option>
+                                <option value="5">5 fps</option>
+                                <option value="10">10 fps</option>
+                                <option value="15">15 fps</option>
+                            </select>
+                            <select id="preview-res" class="select-sm">
+                                <option value="320x180">320x180</option>
+                                <option value="640x360" selected>640x360</option>
+                                <option value="854x480">854x480</option>
+                                <option value="1280x720">1280x720</option>
+                            </select>
+                            <button class="btn btn-sm btn-secondary" id="btn-apply-preview">Apply</button>
+                        </div>
                     </div>
                     <div class="preview-container">
-                        <iframe id="preview-iframe" allow="autoplay" allowfullscreen></iframe>
-                        <div class="preview-overlay" id="preview-overlay">
-                            <p>Enter a preview URL (e.g. MediaMTX WebRTC)</p>
-                            <div class="preview-input-row">
-                                <input type="text" id="preview-url-input" placeholder="http://server:8889/stream/">
-                                <button class="btn btn-primary btn-sm" id="btn-save-preview">Save & Play</button>
-                            </div>
-                        </div>
+                        <img id="preview-snapshot" alt="Preview" style="width:100%;height:100%;object-fit:contain;background:#000;">
                     </div>
                 </div>
             </section>
