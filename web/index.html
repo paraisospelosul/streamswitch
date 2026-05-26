@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>StreamSwitch Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="grid-background"></div>
+
+    <div class="container">
+        <header class="header">
+            <div class="logo">
+                <h1>StreamSwitch</h1>
+                <div class="system-stats">
+                    <div>CPU: <strong id="sys-cpu">0%</strong></div>
+                    <div>RAM: <strong id="sys-ram">0 MB</strong></div>
+                </div>
+            </div>
+            <div class="header-actions">
+                <div class="connection-status" id="ws-status">
+                    <span class="indicator pulsing"></span>
+                    <span class="text">Connecting...</span>
+                </div>
+                <button class="btn btn-secondary btn-sm" id="btn-open-assets">
+                    <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none"><path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/><path d="M12 12v9"/><path d="m16 16-4-4-4 4"/></svg>
+                    Assets
+                </button>
+            </div>
+        </header>
+
+        <main>
+            <!-- Switcher Config (Collapsible) -->
+            <section class="config-section">
+                <div class="card">
+                    <div class="card-header collapsible" id="config-toggle">
+                        <h2>⚙️ Switcher Configuration</h2>
+                        <span class="collapse-icon">▼</span>
+                    </div>
+                    <div class="card-body collapsed" id="config-body">
+                        <div class="config-grid">
+                            <div class="form-group">
+                                <label for="cfg-srt-addr">SRT Address</label>
+                                <input type="text" id="cfg-srt-addr" placeholder="100.79.121.22:8282?streamid=...">
+                            </div>
+                            <div class="form-group">
+                                <label for="cfg-srt-mode">SRT Mode</label>
+                                <select id="cfg-srt-mode">
+                                    <option value="caller">Caller</option>
+                                    <option value="listener">Listener</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label for="cfg-srt-timeout">SRT Timeout (ms)</label>
+                                <input type="number" id="cfg-srt-timeout" min="500" max="10000" value="2000">
+                            </div>
+                            <div class="form-group">
+                                <label for="cfg-min-bitrate">Min Bitrate (kbps) <small>0=off</small></label>
+                                <input type="number" id="cfg-min-bitrate" min="0" max="50000" value="0">
+                            </div>
+                            <div class="form-group">
+                                <label for="cfg-hysteresis">Hysteresis (seconds)</label>
+                                <input type="number" id="cfg-hysteresis" min="1" max="60" value="5">
+                            </div>
+                            <div class="form-group">
+                                <label for="cfg-stats-url">Stats URL (BBox)</label>
+                                <input type="text" id="cfg-stats-url" placeholder="http://...">
+                            </div>
+                        </div>
+                        <div class="form-group" style="margin-top:0.5rem;">
+                            <label>Fallback Path</label>
+                            <div class="readonly-field" id="cfg-fallback-path">—</div>
+                        </div>
+                        <button class="btn btn-primary" id="btn-save-config" style="margin-top:1rem;">Save Configuration</button>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Input Status -->
+            <section class="status-section">
+                <div class="card main-status-card" id="switcher-card">
+                    <div class="card-header">
+                        <h2>Input Status (SRT)</h2>
+                        <div class="status-badge" id="main-status-badge" data-state="fallback">FALLBACK</div>
+                    </div>
+                    <div class="stats-grid">
+                        <div class="stat-box">
+                            <span class="stat-label">Input Bitrate</span>
+                            <span class="stat-value" id="stat-bitrate">0.00 <small>Mbps</small></span>
+                        </div>
+                        <div class="stat-box">
+                            <span class="stat-label">Uptime</span>
+                            <span class="stat-value" id="stat-uptime">—</span>
+                        </div>
+                        <div class="stat-box">
+                            <span class="stat-label">Packets RX</span>
+                            <span class="stat-value" id="stat-packets-rx">0</span>
+                        </div>
+                        <div class="stat-box">
+                            <span class="stat-label">Packets FWD</span>
+                            <span class="stat-value" id="stat-packets-fwd">0</span>
+                        </div>
+                        <div class="stat-box">
+                            <span class="stat-label">PIDs</span>
+                            <span class="stat-value" id="stat-pids">—</span>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Preview -->
+            <section class="preview-section">
+                <div class="card">
+                    <div class="card-header">
+                        <h2>Live Preview</h2>
+                        <button class="btn btn-sm btn-secondary" id="btn-edit-preview" style="display:none;">Edit URL</button>
+                    </div>
+                    <div class="preview-container">
+                        <iframe id="preview-iframe" allow="autoplay" allowfullscreen></iframe>
+                        <div class="preview-overlay" id="preview-overlay">
+                            <p>Enter a preview URL (e.g. MediaMTX WebRTC)</p>
+                            <div class="preview-input-row">
+                                <input type="text" id="preview-url-input" placeholder="http://server:8889/stream/">
+                                <button class="btn btn-primary btn-sm" id="btn-save-preview">Save & Play</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Outputs -->
+            <section class="outputs-section">
+                <div class="section-header">
+                    <h2>Output Destinations</h2>
+                    <button class="btn btn-primary btn-sm" id="btn-add-output">
+                        <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2.5" fill="none"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                        Add Output
+                    </button>
+                </div>
+                <div class="outputs-grid" id="outputs-container">
+                    <div class="empty-state" id="empty-outputs">
+                        <p>No outputs configured yet.</p>
+                        <p><small>Click "Add Output" to send your stream to YouTube, Twitch, etc.</small></p>
+                    </div>
+                </div>
+            </section>
+        </main>
+
+        <footer class="footer">
+            <span>Switches: <strong id="stat-switch-count">0</strong></span>
+            <span>Last: <strong id="stat-last-switch">—</strong></span>
+        </footer>
+    </div>
+
+    <!-- Output Card Template -->
+    <template id="output-card-template">
+        <div class="card output-card" data-id="">
+            <div class="output-header">
+                <h3 class="output-name">Output Name</h3>
+                <div class="output-actions">
+                    <button class="btn-icon btn-edit" title="Edit"><svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button>
+                    <button class="btn-icon btn-logs" title="Logs"><svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none"><rect x="2" y="3" width="20" height="18" rx="2"/><line x1="8" y1="9" x2="16" y2="9"/><line x1="8" y1="13" x2="14" y2="13"/></svg></button>
+                    <button class="btn-icon btn-toggle" title="Start"><svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg></button>
+                    <button class="btn-icon btn-delete" title="Delete"><svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg></button>
+                </div>
+            </div>
+            <div class="output-details">
+                <div class="detail"><span class="detail-label">Status</span><span class="detail-value output-status">Stopped</span></div>
+                <div class="detail"><span class="detail-label">Codec</span><span class="detail-value output-codec">—</span></div>
+                <div class="detail"><span class="detail-label">Bitrate</span><span class="detail-value output-bitrate">—</span></div>
+                <div class="detail"><span class="detail-label">Uptime</span><span class="detail-value output-uptime">—</span></div>
+            </div>
+            <div class="output-error" style="display:none;"></div>
+        </div>
+    </template>
+
+    <!-- Add/Edit Output Modal -->
+    <div class="modal-backdrop" id="add-modal">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>Add New Output</h3>
+                <button class="btn-icon btn-close-modal">&times;</button>
+            </div>
+            <form id="form-add-output">
+                <div class="modal-body">
+                    <div class="form-group">
+                        <label for="out-name">Name</label>
+                        <input type="text" id="out-name" placeholder="YouTube Main" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="out-url">RTMP URL</label>
+                        <input type="text" id="out-url" placeholder="rtmp://a.rtmp.youtube.com/live2" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="out-key">Stream Key <small>(optional)</small></label>
+                        <input type="password" id="out-key" placeholder="xxxx-xxxx-xxxx-xxxx">
+                    </div>
+                    <div class="form-group">
+                        <label for="out-codec">Codec</label>
+                        <select id="out-codec">
+                            <option value="h265">H.265 Passthrough</option>
+                            <option value="h264">H.264 Transcode</option>
+                        </select>
+                    </div>
+                    <div id="h264-options" style="display:none;">
+                        <div class="form-group">
+                            <label for="out-bitrate">Bitrate (kbps)</label>
+                            <input type="number" id="out-bitrate" value="6000" min="500" max="20000">
+                        </div>
+                        <div class="form-group">
+                            <label for="out-preset">FFmpeg Preset</label>
+                            <select id="out-preset">
+                                <option value="ultrafast">ultrafast</option>
+                                <option value="superfast">superfast</option>
+                                <option value="veryfast">veryfast</option>
+                                <option value="faster">faster</option>
+                                <option value="fast">fast</option>
+                            </select>
+                        </div>
+                        <div class="form-group checkbox-group">
+                            <input type="checkbox" id="out-overlay">
+                            <label for="out-overlay">Enable Overlay (Watermark)</label>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-actions">
+                    <button type="button" class="btn btn-secondary btn-cancel-modal">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Save Output</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Logs Modal -->
+    <div class="modal-backdrop" id="logs-modal">
+        <div class="modal modal-wide">
+            <div class="modal-header">
+                <h3>Logs: <span id="logs-output-name"></span></h3>
+                <button class="btn-icon btn-close-modal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="terminal-body">
+                    <pre id="logs-content">Loading logs...</pre>
+                </div>
+            </div>
+            <div class="modal-actions">
+                <button class="btn btn-secondary" id="btn-refresh-logs">Refresh</button>
+                <button class="btn btn-secondary btn-close-modal">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Assets Modal -->
+    <div class="modal-backdrop" id="assets-modal">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>Studio Assets</h3>
+                <button class="btn-icon btn-close-modal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p class="modal-desc">Upload media directly from your browser.</p>
+                <div class="upload-section">
+                    <label>Fallback Media <small>(.jpg, .png, .mp4, .ts)</small></label>
+                    <p class="upload-hint">Shown when your camera connection drops.</p>
+                    <input type="file" id="file-fallback" accept=".jpg,.jpeg,.png,.mp4,.ts">
+                    <button class="btn btn-secondary btn-sm" id="btn-upload-fallback">Upload Fallback</button>
+                </div>
+                <div class="upload-section">
+                    <label>Watermark <small>(.png with transparency)</small></label>
+                    <p class="upload-hint">Overlaid on H.264 outputs when "Enable Overlay" is checked.</p>
+                    <input type="file" id="file-watermark" accept=".png">
+                    <button class="btn btn-secondary btn-sm" id="btn-upload-watermark">Upload Watermark</button>
+                </div>
+            </div>
+            <div class="modal-actions">
+                <button class="btn btn-secondary btn-close-modal">Done</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast Container -->
+    <div id="toast-container"></div>
+
+    <script src="app.js"></script>
+</body>
+</html>

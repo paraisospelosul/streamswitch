@@ -1,0 +1,22 @@
+# Binários compilados
+streamswitch
+streamswitch_final
+*.exe
+
+# Dados sensíveis (contém URLs com senhas e stream keys)
+outputs.json
+switcher.json
+
+# Mídia do usuário
+fallback.*
+watermark.png
+queda.jpeg
+
+# Diretório de dados
+data/
+
+# Arquivos do sistema
+.DS_Store
+*.swp
+*.swo
+*~
