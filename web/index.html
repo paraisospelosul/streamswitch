@@ -33,35 +33,43 @@
         </header>
 
         <main>
-            <!-- Quick Actions -->
-            <section class="actions-bar">
-                <button class="btn btn-action" id="act-restart-srt">🔄 SRT</button>
-                <button class="btn btn-action" id="act-restart-fallback">🔄 Fallback</button>
-                <button class="btn btn-action" id="act-restart-outputs">🔄 Outputs</button>
-                <button class="btn btn-action btn-danger-subtle" id="act-restart-all">⚡ Restart All</button>
+            <!-- Outputs -->
+            <section class="outputs-section">
+                <div class="section-header">
+                    <h2>Output Destinations</h2>
+                    <button class="btn btn-primary btn-sm" id="btn-add-output">+ Add Output</button>
+                </div>
+                <div class="outputs-grid" id="outputs-container">
+                    <div class="empty-state"><p>No outputs configured.</p></div>
+                </div>
             </section>
 
-            <!-- Config (Collapsible) -->
-            <section class="config-section">
+            <!-- Preview -->
+            <section class="preview-section">
                 <div class="card">
-                    <div class="card-header collapsible" id="config-toggle">
-                        <h2>⚙️ Configuration</h2>
-                        <span class="collapse-icon">▼</span>
+                    <div class="card-header">
+                        <h2>Live Preview</h2>
+                        <div class="preview-controls">
+                            <select id="preview-fps" class="select-sm">
+                                <option value="0">Off</option>
+                                <option value="1">1 fps</option>
+                                <option value="2" selected>2 fps</option>
+                                <option value="5">5 fps</option>
+                                <option value="10">10 fps</option>
+                                <option value="15">15 fps</option>
+                                <option value="30">30 fps</option>
+                            </select>
+                            <select id="preview-res" class="select-sm">
+                                <option value="320x180">320p</option>
+                                <option value="640x360" selected>360p</option>
+                                <option value="854x480">480p</option>
+                                <option value="1280x720">720p</option>
+                            </select>
+                            <button class="btn btn-sm btn-secondary" id="btn-apply-preview">Apply</button>
+                        </div>
                     </div>
-                    <div class="card-body collapsed" id="config-body">
-                        <div class="config-grid">
-                            <div class="form-group"><label for="cfg-srt-addr">SRT Address</label><input type="text" id="cfg-srt-addr"></div>
-                            <div class="form-group"><label for="cfg-srt-mode">SRT Mode</label><select id="cfg-srt-mode"><option value="caller">Caller</option><option value="listener">Listener</option></select></div>
-                            <div class="form-group"><label for="cfg-srt-timeout">Timeout (ms)</label><input type="number" id="cfg-srt-timeout" min="500" max="10000"></div>
-                            <div class="form-group"><label for="cfg-min-bitrate">Min Bitrate (kbps)</label><input type="number" id="cfg-min-bitrate" min="0"></div>
-                            <div class="form-group"><label for="cfg-hysteresis">Hysteresis (s)</label><input type="number" id="cfg-hysteresis" min="1" max="60"></div>
-                            <div class="form-group"><label for="cfg-stats-url">Stats URL</label><input type="text" id="cfg-stats-url"></div>
-                        </div>
-                        <div class="form-group" style="margin-top:0.5rem;">
-                            <label for="cfg-fallback-path">Fallback Path</label>
-                            <input type="text" id="cfg-fallback-path" placeholder="/opt/streamswitch/scripts/queda.jpeg">
-                        </div>
-                        <button class="btn btn-primary" id="btn-save-config" style="margin-top:1rem;">Save Configuration</button>
+                    <div class="preview-container">
+                        <img id="preview-snapshot" alt="Preview" style="width:100%;height:100%;object-fit:contain;background:#000;">
                     </div>
                 </div>
             </section>
@@ -90,50 +98,74 @@
                         <div class="vu-db" id="vu-db-value">-∞ dB</div>
                     </div>
                     <!-- Bitrate Chart -->
-                    <div class="chart-container">
-                        <canvas id="bitrate-chart" height="120"></canvas>
+                    <div class="chart-container" style="position:relative;">
+                        <div style="position:absolute; top:5px; left:50%; transform:translateX(-50%); z-index:10;">
+                            <select id="chart-window" class="select-sm" style="background:rgba(0,0,0,0.6); font-size:14px; padding:6px 12px; border-radius:6px; color:#fff; cursor:pointer;">
+                                <option value="1m">1 Min</option>
+                                <option value="5m" selected>5 Min</option>
+                                <option value="30m">30 Min</option>
+                                <option value="1h">1 Hora</option>
+                                <option value="5h">5 Horas</option>
+                                <option value="10h">10 Horas</option>
+                            </select>
+                        </div>
+                        <canvas id="bitrate-chart" height="135"></canvas>
                     </div>
                 </div>
             </section>
 
-            <!-- Preview -->
-            <section class="preview-section">
+            <!-- Belabox Receiver -->
+            <section class="bbox-section">
                 <div class="card">
                     <div class="card-header">
-                        <h2>Live Preview</h2>
-                        <div class="preview-controls">
-                            <select id="preview-fps" class="select-sm">
-                                <option value="0">Off</option>
-                                <option value="1">1 fps</option>
-                                <option value="2" selected>2 fps</option>
-                                <option value="5">5 fps</option>
-                                <option value="10">10 fps</option>
-                                <option value="15">15 fps</option>
-                            </select>
-                            <select id="preview-res" class="select-sm">
-                                <option value="320x180">320p</option>
-                                <option value="640x360" selected>360p</option>
-                                <option value="854x480">480p</option>
-                                <option value="1280x720">720p</option>
-                            </select>
-                            <button class="btn btn-sm btn-secondary" id="btn-apply-preview">Apply</button>
-                        </div>
+                        <h2>📡 Belabox Receiver (Docker)</h2>
+                        <div class="status-badge" id="bbox-status-badge" data-state="unknown">UNKNOWN</div>
                     </div>
-                    <div class="preview-container">
-                        <img id="preview-snapshot" alt="Preview" style="width:100%;height:100%;object-fit:contain;background:#000;">
+                    <div class="card-body">
+                        <div class="bbox-controls">
+                            <button class="btn btn-sm btn-primary" id="btn-bbox-start">▶ Start</button>
+                            <button class="btn btn-sm btn-danger" id="btn-bbox-stop">⏹ Stop</button>
+                            <button class="btn btn-sm btn-secondary" id="btn-bbox-restart">🔄 Restart</button>
+                            <button class="btn btn-sm btn-secondary" id="btn-bbox-logs">📋 Logs</button>
+                            <button class="btn btn-sm btn-secondary" id="btn-bbox-edit-config">✏️ Edit Config</button>
+                            <button class="btn btn-sm btn-secondary" id="btn-bbox-edit-compose">✏️ Edit Compose</button>
+                        </div>
                     </div>
                 </div>
             </section>
 
-            <!-- Outputs -->
-            <section class="outputs-section">
-                <div class="section-header">
-                    <h2>Output Destinations</h2>
-                    <button class="btn btn-primary btn-sm" id="btn-add-output">+ Add Output</button>
+            <!-- Config (Collapsible) -->
+            <section class="config-section">
+                <div class="card">
+                    <div class="card-header collapsible" id="config-toggle">
+                        <h2>⚙️ Configuration</h2>
+                        <span class="collapse-icon">▼</span>
+                    </div>
+                    <div class="card-body collapsed" id="config-body">
+                        <div class="config-grid">
+                            <div class="form-group"><label for="cfg-srt-addr">SRT Address</label><input type="text" id="cfg-srt-addr"></div>
+                            <div class="form-group"><label for="cfg-srt-mode">SRT Mode</label><select id="cfg-srt-mode"><option value="caller">Caller</option><option value="listener">Listener</option></select></div>
+                            <div class="form-group"><label for="cfg-srt-timeout">Timeout (ms)</label><input type="number" id="cfg-srt-timeout" min="500" max="10000"></div>
+                            <div class="form-group"><label for="cfg-min-bitrate">Min Bitrate (kbps)</label><input type="number" id="cfg-min-bitrate" min="0"></div>
+                            <div class="form-group"><label for="cfg-hysteresis">Hysteresis (s)</label><input type="number" id="cfg-hysteresis" min="1" max="60"></div>
+                            <div class="form-group"><label for="cfg-stats-url">Stats URL</label><input type="text" id="cfg-stats-url"></div>
+                            <div class="form-group"><label for="cfg-gop-validation">GOP Validation (pkts)</label><input type="number" id="cfg-gop-validation" min="0" max="30" title="Video packets to wait after keyframe before switching (0=instant)"></div>
+                        </div>
+                        <div class="form-group" style="margin-top:0.5rem;">
+                            <label for="cfg-fallback-path">Fallback Path</label>
+                            <input type="text" id="cfg-fallback-path" placeholder="/opt/streamswitch/scripts/queda.jpeg">
+                        </div>
+                        <button class="btn btn-primary" id="btn-save-config" style="margin-top:1rem;">Save Configuration</button>
+                    </div>
                 </div>
-                <div class="outputs-grid" id="outputs-container">
-                    <div class="empty-state"><p>No outputs configured.</p></div>
-                </div>
+            </section>
+
+            <!-- Quick Actions -->
+            <section class="actions-bar">
+                <button class="btn btn-action" id="act-restart-srt">🔄 SRT</button>
+                <button class="btn btn-action" id="act-restart-fallback">🔄 Fallback</button>
+                <button class="btn btn-action" id="act-restart-outputs">🔄 Outputs</button>
+                <button class="btn btn-action btn-danger-subtle" id="act-restart-all">⚡ Restart All</button>
             </section>
 
             <!-- Switch History -->
@@ -164,10 +196,13 @@
             <div class="output-header">
                 <h3 class="output-name">Output</h3>
                 <div class="output-actions">
-                    <button class="btn-icon btn-edit" title="Edit">✏</button>
                     <button class="btn-icon btn-logs" title="Logs">📋</button>
-                    <button class="btn-icon btn-toggle" title="Start">▶</button>
-                    <button class="btn-icon btn-delete" title="Delete">🗑</button>
+                    <button class="btn-icon btn-unlock" title="Unlock Controls" style="opacity: 0.7;">🔒</button>
+                    <div class="locked-controls" style="display:none; align-items:center; gap:0.2rem; background:rgba(0,0,0,0.3); padding:2px; border-radius:4px; margin-left:4px;">
+                        <button class="btn-icon btn-edit" title="Edit">✏</button>
+                        <button class="btn-icon btn-toggle" title="Start">▶</button>
+                        <button class="btn-icon btn-delete" title="Delete">🗑</button>
+                    </div>
                 </div>
             </div>
             <div class="output-details">
@@ -236,6 +271,29 @@
             <div class="modal-header"><h3>🎥 Recordings</h3><button class="btn-icon btn-close-modal">&times;</button></div>
             <div class="modal-body"><div id="recordings-list"><p class="text-muted">Loading...</p></div></div>
             <div class="modal-actions"><button class="btn btn-secondary" id="btn-refresh-recs">Refresh</button><button class="btn btn-secondary btn-close-modal">Close</button></div>
+        </div>
+    </div>
+
+    <!-- Bbox Config Editor Modal -->
+    <div class="modal-backdrop" id="bbox-editor-modal">
+        <div class="modal modal-wide">
+            <div class="modal-header"><h3 id="bbox-editor-title">Edit File</h3><button class="btn-icon btn-close-modal">&times;</button></div>
+            <div class="modal-body">
+                <textarea id="bbox-editor-textarea" style="width: 100%; height: 300px; font-family: monospace; background: var(--bg-input); color: var(--text-primary); border: 1px solid var(--border-color); padding: 0.5rem; resize: vertical;"></textarea>
+            </div>
+            <div class="modal-actions">
+                <button class="btn btn-secondary btn-close-modal">Cancel</button>
+                <button class="btn btn-primary" id="btn-bbox-save-editor">Save</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Bbox Logs Modal -->
+    <div class="modal-backdrop" id="bbox-logs-modal">
+        <div class="modal modal-wide">
+            <div class="modal-header"><h3>📡 Bbox Logs</h3><button class="btn-icon btn-close-modal">&times;</button></div>
+            <div class="modal-body"><div class="terminal-body"><pre id="bbox-logs-content">Loading...</pre></div></div>
+            <div class="modal-actions"><button class="btn btn-secondary" id="btn-refresh-bbox-logs">Refresh</button><button class="btn btn-secondary btn-close-modal">Close</button></div>
         </div>
     </div>
 

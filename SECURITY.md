@@ -1,21 +1,29 @@
-# Security Policy
+# StreamSwitch Security Policy
 
-## Supported Versions
+## Deployment Recommendations
 
-Use this section to tell people about which versions of your project are
-currently being supported with security updates.
+StreamSwitch is designed to be a lightweight, zero-dependency failover relay for live video streaming. By default, it exposes a Web UI for management and control.
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 5.1.x   | :white_check_mark: |
-| 5.0.x   | :x:                |
-| 4.0.x   | :white_check_mark: |
-| < 4.0   | :x:                |
+If you are deploying StreamSwitch on a public VPS (Virtual Private Server) or any network accessible from the open internet, **you must follow these security guidelines**:
+
+### 1. Enable Basic Authentication (Mandatory)
+Never expose the StreamSwitch Web UI to the public internet without authentication.
+Use the built-in HTTP Basic Auth feature by passing the `--web-user` and `--web-pass` flags when starting the server, or by answering the prompts during the `./install.sh` automated installation.
+
+### 2. Encrypt Traffic with HTTPS or a VPN
+Basic Authentication transmits credentials in plain text. To prevent network sniffing and credential theft:
+- **VPN / Tailscale (Recommended):** The easiest and most secure method. Install [Tailscale](https://tailscale.com/) on your VPS and your local machine. Access the Web UI exclusively via the secure `100.x.x.x` Tailscale IP. This guarantees end-to-end encryption without needing to configure domain names or SSL certificates.
+- **Reverse Proxy (Nginx / Caddy):** If you need public access via a domain name (e.g., `panel.yourdomain.com`), configure a reverse proxy like Nginx or Caddy in front of StreamSwitch (Port 80) and secure it with a free Let's Encrypt SSL certificate.
+
+### 3. Belabox Receiver (Docker) Security
+StreamSwitch integrates with the `datagutt/belabox-receiver` Docker container. The automated `install.sh` script applies several security hardnenings by default:
+- Drops container privileges (`no-new-privileges: true`).
+- Restricts resources (RAM, CPU, PID limits) to prevent DDoS attacks from taking down the host system.
+- Mounts `/tmp` and `/var/log` as read-only (`noexec`, `nosuid`) `tmpfs` volumes.
+
+Keep the authentication keys in your `config.json` strong and unique to prevent unauthorized video injection.
 
 ## Reporting a Vulnerability
 
-Use this section to tell people how to report a vulnerability.
-
-Tell them where to go, how often they can expect to get an update on a
-reported vulnerability, what to expect if the vulnerability is accepted or
-declined, etc.
+If you discover a security vulnerability within StreamSwitch, please do not open a public issue.
+Instead, send a private message or email to the repository maintainer. Security issues will be treated with high priority.

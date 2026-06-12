@@ -5,6 +5,7 @@ streamswitch_final
 
 # Dados sensíveis
 .env
+install_personal.sh
 
 # Mídia local
 fallback.*

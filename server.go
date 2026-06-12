@@ -28,15 +28,18 @@ type APIServer struct {
 	preview       *PreviewManager
 	audioMeter    *AudioMeter
 	recorder      *Recorder
+	bboxManager   *BboxManager
 	dataDir       string
 	port          int
+	webUser       string
+	webPass       string
 
 	upgrader  websocket.Upgrader
 	clients   map[*websocket.Conn]bool
 	clientsMu sync.Mutex
 }
 
-func NewAPIServer(switcher *Switcher, outputManager *OutputManager, sysStats *SysStatsMonitor, preview *PreviewManager, audioMeter *AudioMeter, recorder *Recorder, dataDir string, port int) *APIServer {
+func NewAPIServer(switcher *Switcher, outputManager *OutputManager, sysStats *SysStatsMonitor, preview *PreviewManager, audioMeter *AudioMeter, recorder *Recorder, bboxManager *BboxManager, dataDir string, port int, webUser string, webPass string) *APIServer {
 	return &APIServer{
 		switcher:      switcher,
 		outputManager: outputManager,
@@ -44,11 +47,30 @@ func NewAPIServer(switcher *Switcher, outputManager *OutputManager, sysStats *Sy
 		preview:       preview,
 		audioMeter:    audioMeter,
 		recorder:      recorder,
+		bboxManager:   bboxManager,
 		dataDir:       dataDir,
 		port:          port,
+		webUser:       webUser,
+		webPass:       webPass,
 		upgrader:      websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }},
 		clients:       make(map[*websocket.Conn]bool),
 	}
+}
+
+func (s *APIServer) basicAuthMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.webUser == "" && s.webPass == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		user, pass, ok := r.BasicAuth()
+		if !ok || user != s.webUser || pass != s.webPass {
+			w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 type StatusResponse struct {
@@ -75,19 +97,37 @@ func (s *APIServer) Run() error {
 	mux.HandleFunc("/api/recording", s.handleRecording)
 	mux.HandleFunc("/api/recordings", s.handleRecordings)
 	mux.HandleFunc("/api/recordings/", s.handleRecordingAction)
+	
+	// Bbox routes
+	mux.HandleFunc("/api/bbox/status", s.handleBboxStatus)
+	mux.HandleFunc("/api/bbox/action", s.handleBboxAction)
+	mux.HandleFunc("/api/bbox/logs", s.handleBboxLogs)
+	mux.HandleFunc("/api/bbox/config", s.handleBboxConfig)
+	mux.HandleFunc("/api/bbox/compose", s.handleBboxCompose)
+
 	mux.HandleFunc("/ws", s.handleWebSocket)
 
 	webContent, err := fs.Sub(webFS, "web")
 	if err != nil {
 		return fmt.Errorf("embed fs: %w", err)
 	}
-	mux.Handle("/", http.FileServer(http.FS(webContent)))
+	fileServer := http.FileServer(http.FS(webContent))
+	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		w.Header().Set("Pragma", "no-cache")
+		w.Header().Set("Expires", "0")
+		fileServer.ServeHTTP(w, r)
+	}))
 
 	go s.broadcastLoop()
 
 	addr := fmt.Sprintf(":%d", s.port)
-	log.Printf("[server] Web UI at http://0.0.0.0%s", addr)
-	return http.ListenAndServe(addr, mux)
+	if s.webUser != "" {
+		log.Printf("[server] Web UI at http://0.0.0.0%s (Protected with Basic Auth)", addr)
+	} else {
+		log.Printf("[server] Web UI at http://0.0.0.0%s (WARNING: Open access, no auth!)", addr)
+	}
+	return http.ListenAndServe(addr, s.basicAuthMiddleware(mux))
 }
 
 // ─── Status ───
@@ -295,6 +335,13 @@ func (s *APIServer) handleRecordingAction(w http.ResponseWriter, r *http.Request
 	w.Header().Set("Content-Type", "application/json")
 	name := r.URL.Path[len("/api/recordings/"):]
 
+	// Path traversal protection
+	name = filepath.Base(name)
+	if name == "." || name == ".." || name == "" {
+		http.Error(w, "invalid filename", http.StatusBadRequest)
+		return
+	}
+
 	switch r.Method {
 	case http.MethodGet:
 		// Download file
@@ -326,8 +373,14 @@ func (s *APIServer) handleRecordingAction(w http.ResponseWriter, r *http.Request
 			http.Error(w, "provide new_name", http.StatusBadRequest)
 			return
 		}
+		// Sanitize new name too
+		safeName := filepath.Base(body.NewName)
+		if safeName == "." || safeName == ".." || safeName == "" {
+			http.Error(w, "invalid new_name", http.StatusBadRequest)
+			return
+		}
 		oldPath := filepath.Join(s.recorder.recordDir, name)
-		newPath := filepath.Join(s.recorder.recordDir, body.NewName)
+		newPath := filepath.Join(s.recorder.recordDir, safeName)
 		if err := os.Rename(oldPath, newPath); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
@@ -386,13 +439,28 @@ func (s *APIServer) broadcastLoop() {
 			s.clientsMu.Unlock()
 			continue
 		}
+		// Collect clients under lock, send without lock
+		conns := make([]*websocket.Conn, 0, len(s.clients))
 		for conn := range s.clients {
-			if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
-				conn.Close()
-				delete(s.clients, conn)
-			}
+			conns = append(conns, conn)
 		}
 		s.clientsMu.Unlock()
+
+		var failed []*websocket.Conn
+		for _, conn := range conns {
+			conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+				conn.Close()
+				failed = append(failed, conn)
+			}
+		}
+		if len(failed) > 0 {
+			s.clientsMu.Lock()
+			for _, conn := range failed {
+				delete(s.clients, conn)
+			}
+			s.clientsMu.Unlock()
+		}
 	}
 }
 
@@ -494,6 +562,113 @@ func (s *APIServer) handlePreviewSettings(w http.ResponseWriter, r *http.Request
 		s.preview.UpdateSettings(fps, width, height)
 		json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
 	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// ─── Bbox ───
+
+func (s *APIServer) handleBboxStatus(w http.ResponseWriter, r *http.Request) {
+	status, err := s.bboxManager.GetStatus()
+	w.Header().Set("Content-Type", "application/json")
+	if err != nil {
+		json.NewEncoder(w).Encode(map[string]string{"status": "error", "error": err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]string{"status": status})
+}
+
+func (s *APIServer) handleBboxAction(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	action := r.URL.Query().Get("action")
+	var err error
+	switch action {
+	case "start":
+		err = s.bboxManager.Start()
+	case "stop":
+		err = s.bboxManager.Stop()
+	case "restart":
+		err = s.bboxManager.Restart()
+	default:
+		http.Error(w, "Invalid action", http.StatusBadRequest)
+		return
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]string{"status": "success"})
+}
+
+func (s *APIServer) handleBboxLogs(w http.ResponseWriter, r *http.Request) {
+	logs, err := s.bboxManager.GetLogs(100)
+	w.Header().Set("Content-Type", "application/json")
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]string{"logs": logs})
+}
+
+func (s *APIServer) handleBboxConfig(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method == http.MethodGet {
+		config, err := s.bboxManager.ReadConfig()
+		if err != nil {
+			json.NewEncoder(w).Encode(map[string]string{"content": "{}"})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]string{"content": config})
+	} else if r.Method == http.MethodPut {
+		var req struct {
+			Content string `json:"content"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Bad request", http.StatusBadRequest)
+			return
+		}
+		if err := s.bboxManager.WriteConfig(req.Content); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]string{"status": "success"})
+	} else {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *APIServer) handleBboxCompose(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method == http.MethodGet {
+		config, err := s.bboxManager.ReadCompose()
+		if err != nil {
+			json.NewEncoder(w).Encode(map[string]string{"content": ""})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]string{"content": config})
+	} else if r.Method == http.MethodPut {
+		var req struct {
+			Content string `json:"content"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Bad request", http.StatusBadRequest)
+			return
+		}
+		if err := s.bboxManager.WriteCompose(req.Content); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]string{"status": "success"})
+	} else {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
 }

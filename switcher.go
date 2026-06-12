@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -45,6 +46,7 @@ type SwitcherConfig struct {
 	FallbackPath             string `json:"fallback_path"`
 	MinBitrateKbps           int    `json:"min_bitrate_kbps"`
 	BitrateHysteresisSeconds int    `json:"bitrate_hysteresis_seconds"`
+	GOPValidationPackets     int    `json:"gop_validation_packets"` // Min video packets after keyframe before switching (0=instant)
 }
 
 // SwitchEvent records a state transition
@@ -69,7 +71,7 @@ type SwitcherStats struct {
 	Uptime            string        `json:"uptime"`
 	VideoPID          uint16        `json:"video_pid"`
 	AudioPID          uint16        `json:"audio_pid"`
-	BitrateHistory    []float64     `json:"bitrate_history"`
+	BitrateHistory    map[string][]float64 `json:"bitrate_history"`
 	RecentEvents      []SwitchEvent `json:"recent_events"`
 }
 
@@ -157,13 +159,11 @@ func (ip *InputProcess) Start() error {
 		return fmt.Errorf("start ffmpeg: %w", err)
 	}
 	ip.running.Store(true)
-	// Drain stderr to avoid blocking
+	// Drain stderr and log it (since loglevel is error, this won't spam)
 	go func() {
-		buf := make([]byte, 4096)
-		for {
-			if _, err := ip.stderr.Read(buf); err != nil {
-				return
-			}
+		scanner := bufio.NewScanner(ip.stderr)
+		for scanner.Scan() {
+			log.Printf("[%s] FFmpeg: %s", ip.name, scanner.Text())
 		}
 	}()
 	log.Printf("[%s] FFmpeg started (PID %d)", ip.name, ip.cmd.Process.Pid)
@@ -216,8 +216,8 @@ type Switcher struct {
 	lowBitrateStart time.Time
 	inLowBitrate    bool
 
-	// Bitrate history ring buffer (300 = 5min at 1/sec)
-	bitrateHistory    [300]float64
+	// Bitrate history ring buffer (36000 = 10 hours at 1/sec)
+	bitrateHistory    [36000]float64
 	bitrateHistoryIdx int
 	bitrateHistoryLen int
 	bitrateHistoryMu  sync.RWMutex
@@ -229,6 +229,12 @@ type Switcher struct {
 	// Restart channels (quick action buttons)
 	restartSRTCh      chan struct{}
 	restartFallbackCh chan struct{}
+
+	// GOP boundary validation for cross-fade
+	gopValidating       bool       // true when we found keyframe and are validating GOP
+	gopValidationCount  int        // video packets received after keyframe
+	gopBuffer           [][]byte   // buffered packets during validation
+	gopKeyframeTime     time.Time  // when the keyframe was detected
 
 	// Output distribution
 	broadcaster *Broadcaster
@@ -245,6 +251,7 @@ func NewSwitcher(srtAddr, srtMode, fallbackPath string, timeoutMs int, statsURL 
 			StatsURL:                 statsURL,
 			MinBitrateKbps:           0,
 			BitrateHysteresisSeconds: 5,
+			GOPValidationPackets:     3,
 		},
 		configPath:        configPath,
 		dataDir:           dataDir,
@@ -360,16 +367,53 @@ func (s *Switcher) GetSwitchHistory() []SwitchEvent {
 	return events
 }
 
-func (s *Switcher) getBitrateHistory() []float64 {
+func (s *Switcher) getBitrateHistory() map[string][]float64 {
+	return map[string][]float64{
+		"1m":  s.getBitrateHistoryForWindow(60),
+		"5m":  s.getBitrateHistoryForWindow(300),
+		"30m": s.getBitrateHistoryForWindow(1800),
+		"1h":  s.getBitrateHistoryForWindow(3600),
+		"5h":  s.getBitrateHistoryForWindow(18000),
+		"10h": s.getBitrateHistoryForWindow(36000),
+	}
+}
+
+func (s *Switcher) getBitrateHistoryForWindow(seconds int) []float64 {
 	s.bitrateHistoryMu.RLock()
 	defer s.bitrateHistoryMu.RUnlock()
-	result := make([]float64, s.bitrateHistoryLen)
 	if s.bitrateHistoryLen == 0 {
-		return result
+		return []float64{}
 	}
-	start := (s.bitrateHistoryIdx - s.bitrateHistoryLen + 300) % 300
-	for i := 0; i < s.bitrateHistoryLen; i++ {
-		result[i] = s.bitrateHistory[(start+i)%300]
+
+	lookback := seconds
+	if lookback > s.bitrateHistoryLen {
+		lookback = s.bitrateHistoryLen
+	}
+
+	targetPoints := 300
+	if lookback < targetPoints {
+		targetPoints = lookback
+	}
+
+	result := make([]float64, targetPoints)
+	start := (s.bitrateHistoryIdx - lookback + 36000) % 36000
+	pointsPerBucket := float64(lookback) / float64(targetPoints)
+
+	for i := 0; i < targetPoints; i++ {
+		bucketStart := int(float64(i) * pointsPerBucket)
+		bucketEnd := int(float64(i+1) * pointsPerBucket)
+		if bucketEnd > lookback {
+			bucketEnd = lookback
+		}
+
+		var sum float64
+		for j := bucketStart; j < bucketEnd; j++ {
+			sum += s.bitrateHistory[(start+j)%36000]
+		}
+		count := bucketEnd - bucketStart
+		if count > 0 {
+			result[i] = sum / float64(count)
+		}
 	}
 	return result
 }
@@ -512,6 +556,7 @@ func (s *Switcher) statsPoller(ctx context.Context, forceFallbackCh chan struct{
 	}
 }
 
+
 func (s *Switcher) checkBitrateThreshold() bool {
 	s.configMu.RLock()
 	minBitrate := s.config.MinBitrateKbps
@@ -574,24 +619,31 @@ func (s *Switcher) Run(ctx context.Context) error {
 					return nil
 				}
 				s.processPackets(data)
-				if info, ok := ParseTSPacket(data); ok {
-					if s.videoPID == 0 || info.PID == s.videoPID {
-						s.configMu.RLock()
-						td := time.Duration(s.config.SRTTimeout) * time.Millisecond
-						s.configMu.RUnlock()
-						timeout.Reset(td)
+				if s.containsVideo(data) {
+					s.configMu.RLock()
+					td := time.Duration(s.config.SRTTimeout) * time.Millisecond
+					s.configMu.RUnlock()
+					if !timeout.Stop() {
+						select {
+						case <-timeout.C:
+						default:
+						}
 					}
+					timeout.Reset(td)
 				}
 				s.broadcaster.Broadcast(data)
 				s.packetsForwarded.Add(1)
 			case <-timeout.C:
 				s.setStateWithReason(StateFallback, "SRT timeout")
+				s.RestartSRT() // Kill zombie ffmpeg so it reconnects to new Bbox session
 			case <-bitrateCheckTicker.C:
 				if s.checkBitrateThreshold() {
 					s.setStateWithReason(StateFallback, "bitrate below minimum")
+					s.RestartSRT() // Kill zombie ffmpeg so it reconnects to new Bbox session
 				}
 			case <-forceFallbackCh:
 				s.setStateWithReason(StateFallback, "no publishers (API)")
+				s.RestartSRT() // Kill ffmpeg, it will wait for API to report publisher back
 			case <-srtDiedCh:
 				s.setStateWithReason(StateFallback, "SRT process died")
 			case <-ctx.Done():
@@ -605,23 +657,90 @@ func (s *Switcher) Run(ctx context.Context) error {
 				s.packetsForwarded.Add(1)
 			case data, ok := <-srtDataCh:
 				if ok {
-					if s.containsKeyframe(data) {
-						s.setStateWithReason(StateLive, "SRT keyframe detected")
-						s.configMu.RLock()
-						td := time.Duration(s.config.SRTTimeout) * time.Millisecond
-						s.configMu.RUnlock()
-						timeout.Reset(td)
-						s.processPackets(data)
-						s.broadcaster.Broadcast(data)
-						s.packetsForwarded.Add(1)
+					s.configMu.RLock()
+					gopThreshold := s.config.GOPValidationPackets
+					s.configMu.RUnlock()
+					if gopThreshold <= 0 {
+						gopThreshold = 0 // instant switch (legacy behavior)
+					}
+
+					if s.gopValidating {
+						// We already found a keyframe, now validating GOP stability
+						if s.containsVideo(data) {
+							s.gopValidationCount++
+							s.gopBuffer = append(s.gopBuffer, data)
+
+							if s.gopValidationCount >= gopThreshold {
+								// GOP validated — commit switch to live
+								s.setStateWithReason(StateLive, fmt.Sprintf("SRT GOP validated (%d pkts)", s.gopValidationCount))
+								s.configMu.RLock()
+								td := time.Duration(s.config.SRTTimeout) * time.Millisecond
+								s.configMu.RUnlock()
+								if !timeout.Stop() {
+									select {
+									case <-timeout.C:
+									default:
+									}
+								}
+								timeout.Reset(td)
+								// Flush all buffered GOP packets to broadcaster
+								for _, buffered := range s.gopBuffer {
+									s.processPackets(buffered)
+									s.broadcaster.Broadcast(buffered)
+									s.packetsForwarded.Add(1)
+								}
+								s.gopValidating = false
+								s.gopBuffer = nil
+							}
+						} else {
+							// Non-video data during validation — just buffer it
+							s.gopBuffer = append(s.gopBuffer, data)
+						}
+
+						// Timeout safety: if validation takes too long (>2s), abort
+						if time.Since(s.gopKeyframeTime) > 2*time.Second {
+							log.Printf("[switcher] GOP validation timed out after %d packets, aborting", s.gopValidationCount)
+							s.gopValidating = false
+							s.gopBuffer = nil
+						}
+					} else if s.containsKeyframe(data) {
+						// Keyframe detected — start GOP validation
+						if gopThreshold == 0 {
+							// Instant switch (legacy behavior, no validation)
+							s.setStateWithReason(StateLive, "SRT keyframe detected")
+							s.configMu.RLock()
+							td := time.Duration(s.config.SRTTimeout) * time.Millisecond
+							s.configMu.RUnlock()
+							if !timeout.Stop() {
+								select {
+								case <-timeout.C:
+								default:
+								}
+							}
+							timeout.Reset(td)
+							s.processPackets(data)
+							s.broadcaster.Broadcast(data)
+							s.packetsForwarded.Add(1)
+						} else {
+							// Start GOP validation window
+							s.gopValidating = true
+							s.gopValidationCount = 0
+							s.gopKeyframeTime = time.Now()
+							s.gopBuffer = [][]byte{data} // buffer the keyframe packet
+							log.Printf("[switcher] Keyframe detected, validating GOP (need %d video pkts)...", gopThreshold)
+						}
 					} else {
 						// SRT data but no keyframe yet — stay in backup silently
 					}
 				}
 			case <-forceFallbackCh:
-				// Stay in fallback
+				// Stay in fallback, abort any GOP validation
+				s.gopValidating = false
+				s.gopBuffer = nil
 			case <-srtDiedCh:
-				// SRT still down
+				// SRT still down, abort any GOP validation
+				s.gopValidating = false
+				s.gopBuffer = nil
 			case <-ctx.Done():
 				return nil
 			}
@@ -773,49 +892,49 @@ func (s *Switcher) readInputLoop(ctx context.Context, proc *InputProcess, dataCh
 }
 
 func (s *Switcher) processPackets(data []byte) {
-	if len(data) < tsPacketSize {
-		return
-	}
-	info, ok := ParseTSPacket(data)
-	if !ok {
-		return
-	}
-	if info.PID == patPID && info.PUSI && info.HasPayload {
-		if pmtPID := ParsePAT(data[info.PayloadOffset:]); pmtPID != 0 {
-			s.pmtPID = pmtPID
+	for offset := 0; offset+tsPacketSize <= len(data); offset += tsPacketSize {
+		pkt := data[offset : offset+tsPacketSize]
+		info, ok := ParseTSPacket(pkt)
+		if !ok {
+			continue
 		}
-	}
-	if info.PID == s.pmtPID && s.pmtPID != 0 && info.PUSI && info.HasPayload {
-		vPID, aPID := ParsePMT(data[info.PayloadOffset:])
-		if vPID != 0 {
-			if s.videoPID != vPID {
-				log.Printf("[switcher] Video PID: %d", vPID)
+		if info.PID == patPID && info.PUSI && info.HasPayload {
+			if pmtPID := ParsePAT(pkt[info.PayloadOffset:]); pmtPID != 0 {
+				s.pmtPID = pmtPID
 			}
-			s.videoPID = vPID
 		}
-		if aPID != 0 {
-			if s.audioPID != aPID {
-				log.Printf("[switcher] Audio PID: %d", aPID)
+		if info.PID == s.pmtPID && s.pmtPID != 0 && info.PUSI && info.HasPayload {
+			vPID, aPID := ParsePMT(pkt[info.PayloadOffset:])
+			if vPID != 0 {
+				if s.videoPID != vPID {
+					log.Printf("[switcher] Video PID: %d", vPID)
+				}
+				s.videoPID = vPID
 			}
-			s.audioPID = aPID
+			if aPID != 0 {
+				if s.audioPID != aPID {
+					log.Printf("[switcher] Audio PID: %d", aPID)
+				}
+				s.audioPID = aPID
+			}
 		}
 	}
 }
 
 func (s *Switcher) containsKeyframe(data []byte) bool {
-	if len(data) < tsPacketSize {
-		return false
-	}
-	info, ok := ParseTSPacket(data)
-	if !ok {
-		return false
-	}
 	s.processPackets(data)
-	if info.PID == s.videoPID && s.videoPID != 0 && info.PUSI && info.HasPayload {
-		pesPayload := ExtractPESPayload(data, info.PayloadOffset)
-		if pesPayload != nil && IsKeyframe(pesPayload) {
-			s.keyframesDetected.Add(1)
-			return true
+	for offset := 0; offset+tsPacketSize <= len(data); offset += tsPacketSize {
+		pkt := data[offset : offset+tsPacketSize]
+		info, ok := ParseTSPacket(pkt)
+		if !ok {
+			continue
+		}
+		if info.PID == s.videoPID && s.videoPID != 0 && info.PUSI && info.HasPayload {
+			pesPayload := ExtractPESPayload(pkt, info.PayloadOffset)
+			if pesPayload != nil && IsKeyframe(pesPayload) {
+				s.keyframesDetected.Add(1)
+				return true
+			}
 		}
 	}
 	return false
@@ -832,8 +951,8 @@ func (s *Switcher) bitrateLoop(ctx context.Context) {
 			s.currentBitrateKbps.Store(kbps)
 			s.bitrateHistoryMu.Lock()
 			s.bitrateHistory[s.bitrateHistoryIdx] = float64(kbps)
-			s.bitrateHistoryIdx = (s.bitrateHistoryIdx + 1) % 300
-			if s.bitrateHistoryLen < 300 {
+			s.bitrateHistoryIdx = (s.bitrateHistoryIdx + 1) % 36000
+			if s.bitrateHistoryLen < 36000 {
 				s.bitrateHistoryLen++
 			}
 			s.bitrateHistoryMu.Unlock()
@@ -841,4 +960,18 @@ func (s *Switcher) bitrateLoop(ctx context.Context) {
 			return
 		}
 	}
+}
+
+func (s *Switcher) containsVideo(data []byte) bool {
+	if s.videoPID == 0 {
+		return true
+	}
+	for offset := 0; offset+tsPacketSize <= len(data); offset += tsPacketSize {
+		pkt := data[offset : offset+tsPacketSize]
+		info, ok := ParseTSPacket(pkt)
+		if ok && info.PID == s.videoPID {
+			return true
+		}
+	}
+	return false
 }

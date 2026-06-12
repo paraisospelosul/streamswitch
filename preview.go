@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"io"
 	"log"
 	"os/exec"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -28,7 +30,7 @@ type PreviewManager struct {
 
 	// Process management
 	cmd     *exec.Cmd
-	running bool
+	running atomic.Bool
 	stopCh  chan struct{}
 }
 
@@ -53,8 +55,8 @@ func (p *PreviewManager) UpdateSettings(fps, width, height int) {
 	if fps < 0 {
 		fps = 0
 	}
-	if fps > 15 {
-		fps = 15
+	if fps > 30 {
+		fps = 30
 	}
 	p.fps = fps
 	p.width = width
@@ -63,7 +65,7 @@ func (p *PreviewManager) UpdateSettings(fps, width, height int) {
 
 	if fps == 0 {
 		// Turn off preview
-		if p.running {
+		if p.running.Load() {
 			p.Stop()
 		}
 		p.frameMu.Lock()
@@ -74,7 +76,7 @@ func (p *PreviewManager) UpdateSettings(fps, width, height int) {
 	}
 
 	// Restart with new settings
-	if p.running {
+	if p.running.Load() {
 		p.Stop()
 	}
 	go p.Start()
@@ -101,14 +103,14 @@ func (p *PreviewManager) Start() {
 	p.mu.RUnlock()
 
 	p.stopCh = make(chan struct{})
-	p.running = true
+	p.running.Store(true)
 
 	log.Printf("[preview] Starting preview: %dfps %dx%d q%d", fps, width, height, quality)
 
-	for p.running {
+	for p.running.Load() {
 		p.runPreviewProcess(fps, width, height, quality)
 
-		if !p.running {
+		if !p.running.Load() {
 			break
 		}
 
@@ -121,7 +123,7 @@ func (p *PreviewManager) Start() {
 }
 
 func (p *PreviewManager) Stop() {
-	p.running = false
+	p.running.Store(false)
 	select {
 	case <-p.stopCh:
 	default:
@@ -151,10 +153,10 @@ func (p *PreviewManager) runPreviewProcess(fps, width, height, quality int) {
 		"-probesize", "1000000",
 		"-f", "mpegts",
 		"-i", "pipe:0",
-		"-vf", fmt.Sprintf("scale=%d:%d", width, height),
-		"-r", fmt.Sprintf("%d", fps),
+		"-vf", fmt.Sprintf("fps=%d,scale=%d:%d:flags=fast_bilinear", fps, width, height),
 		"-q:v", fmt.Sprintf("%d", quality),
 		"-an",
+		"-threads", "2",
 		"-f", "image2pipe",
 		"-vcodec", "mjpeg",
 		"pipe:1",
@@ -174,6 +176,12 @@ func (p *PreviewManager) runPreviewProcess(fps, width, height, quality int) {
 		return
 	}
 
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		log.Printf("[preview] stderr pipe error: %v", err)
+		return
+	}
+
 	if err := cmd.Start(); err != nil {
 		log.Printf("[preview] start error: %v", err)
 		return
@@ -184,6 +192,13 @@ func (p *PreviewManager) runPreviewProcess(fps, width, height, quality int) {
 	p.mu.Unlock()
 
 	log.Printf("[preview] FFmpeg started (PID %d)", cmd.Process.Pid)
+
+	go func() {
+		scanner := bufio.NewScanner(stderr)
+		for scanner.Scan() {
+			log.Printf("[preview] FFmpeg: %s", scanner.Text())
+		}
+	}()
 
 	// Write broadcaster data to FFmpeg stdin
 	go func() {

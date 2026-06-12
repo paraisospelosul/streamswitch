@@ -60,7 +60,10 @@ document.addEventListener('DOMContentLoaded', () => {
             document.getElementById('stat-switch-count').textContent = sw.switch_count || 0;
             document.getElementById('stat-last-switch').textContent = sw.last_switch_time ? new Date(sw.last_switch_time).toLocaleTimeString() : '—';
 
-            if (sw.bitrate_history) drawBitrateChart(sw.bitrate_history);
+            const win = document.getElementById('chart-window').value || '5m';
+            if (sw.bitrate_history && sw.bitrate_history[win]) {
+                drawBitrateChart(sw.bitrate_history[win], win);
+            }
             if (sw.recent_events) renderHistory(sw.recent_events);
         }
 
@@ -80,14 +83,14 @@ document.addEventListener('DOMContentLoaded', () => {
     const chartCanvas = document.getElementById('bitrate-chart');
     const chartCtx = chartCanvas.getContext('2d');
 
-    function drawBitrateChart(history) {
+    function drawBitrateChart(history, win = '5m') {
         const dpr = window.devicePixelRatio || 1;
         const rect = chartCanvas.getBoundingClientRect();
         chartCanvas.width = rect.width * dpr;
-        chartCanvas.height = 120 * dpr;
+        chartCanvas.height = 135 * dpr;
         chartCtx.scale(dpr, dpr);
 
-        const w = rect.width, h = 120;
+        const w = rect.width, h = 135;
         const pad = { top: 10, right: 10, bottom: 20, left: 45 };
         const plotW = w - pad.left - pad.right;
         const plotH = h - pad.top - pad.bottom;
@@ -95,9 +98,13 @@ document.addEventListener('DOMContentLoaded', () => {
         chartCtx.clearRect(0, 0, w, h);
         if (!history || history.length === 0) return;
 
-        const maxKbps = Math.max(1000, ...history) * 1.1;
+        let sorted = history.slice().sort((a,b) => a - b);
+        let p95 = sorted[Math.floor(sorted.length * 0.95)] || 1000;
+        let maxKbps = p95 * 1.2;
+        if (maxKbps < 6000) maxKbps = 6000; // Force chart to at least 0-6 Mbps range
+        if (maxKbps > 15000) maxKbps = 15000; // Cap visual scale to 15Mbps to avoid huge spikes breaking the chart
 
-        // Grid
+        // Grid Y
         chartCtx.strokeStyle = 'rgba(255,255,255,0.05)';
         chartCtx.lineWidth = 1;
         for (let i = 0; i <= 4; i++) {
@@ -107,6 +114,28 @@ document.addEventListener('DOMContentLoaded', () => {
             chartCtx.font = '9px Inter, sans-serif';
             chartCtx.textAlign = 'right';
             chartCtx.fillText(((maxKbps / 4) * (4 - i) / 1000).toFixed(1) + 'M', pad.left - 5, y + 3);
+        }
+
+        // Grid X (Time labels)
+        chartCtx.fillStyle = 'rgba(255,255,255,0.4)';
+        chartCtx.textAlign = 'center';
+        chartCtx.font = '9px Inter, sans-serif';
+        const segments = 4;
+        const nowMs = Date.now();
+        let totalMs = 300000; // 5m
+        if (win === '1m') totalMs = 60000;
+        else if (win === '30m') totalMs = 1800000;
+        else if (win === '1h') totalMs = 3600000;
+        else if (win === '5h') totalMs = 18000000;
+        else if (win === '10h') totalMs = 36000000;
+
+        for (let i = 0; i <= segments; i++) {
+            const x = pad.left + (plotW / segments) * i;
+            chartCtx.beginPath(); chartCtx.moveTo(x, pad.top); chartCtx.lineTo(x, pad.top + plotH); chartCtx.stroke();
+            const timeMs = nowMs - totalMs + (totalMs / segments) * i;
+            const d = new Date(timeMs);
+            const timeStr = d.getHours().toString().padStart(2, '0') + ':' + d.getMinutes().toString().padStart(2, '0');
+            chartCtx.fillText(timeStr, x, pad.top + plotH + 12);
         }
 
         // Fill
@@ -256,6 +285,11 @@ document.addEventListener('DOMContentLoaded', () => {
     function renderOutputs(outputs) {
         const container = document.getElementById('outputs-container');
         if (!outputs || outputs.length === 0) { container.innerHTML = '<div class="empty-state"><p>No outputs configured.</p></div>'; return; }
+        
+        // Remove empty state if it exists
+        const emptyState = container.querySelector('.empty-state');
+        if (emptyState) emptyState.remove();
+
         const existing = new Map();
         container.querySelectorAll('.output-card').forEach(c => existing.set(c.dataset.id, c));
         outputs.forEach(out => {
@@ -278,6 +312,18 @@ document.addEventListener('DOMContentLoaded', () => {
         card.querySelector('.btn-delete').addEventListener('click', () => deleteOutput(id));
         card.querySelector('.btn-edit').addEventListener('click', () => editOutput(id));
         card.querySelector('.btn-logs').addEventListener('click', () => showLogs(id));
+        card.querySelector('.btn-unlock').addEventListener('click', (e) => {
+            const locked = card.querySelector('.locked-controls');
+            if (locked.style.display === 'none') {
+                locked.style.display = 'flex';
+                e.target.textContent = '🔓';
+                e.target.style.opacity = '1';
+            } else {
+                locked.style.display = 'none';
+                e.target.textContent = '🔒';
+                e.target.style.opacity = '0.7';
+            }
+        });
     }
 
     function updateOutputCard(card, out) {
@@ -287,10 +333,13 @@ document.addEventListener('DOMContentLoaded', () => {
         s.textContent = out.running ? 'Running' : 'Stopped';
         s.className = `detail-value output-status ${out.running ? 'running' : 'stopped'}`;
         card.querySelector('.output-codec').textContent = out.codec === 'h264' ? 'H.264' : 'H.265';
-        card.querySelector('.output-bitrate').textContent = out.bitrate ? out.bitrate + 'k' : 'Copy';
+        const bitrateText = out.running && out.output_bitrate_kbps > 0
+            ? (out.output_bitrate_kbps / 1000).toFixed(2) + ' Mbps'
+            : (out.bitrate ? out.bitrate + 'k' : 'Copy');
+        card.querySelector('.output-bitrate').textContent = bitrateText;
         card.querySelector('.output-uptime').textContent = out.uptime || '—';
         const e = card.querySelector('.output-error');
-        if (out.last_error) { e.style.display = 'block'; e.textContent = out.last_error; } else e.style.display = 'none';
+        if (out.error) { e.style.display = 'block'; e.textContent = out.error; } else e.style.display = 'none';
         const t = card.querySelector('.btn-toggle');
         t.title = out.running ? 'Stop' : 'Start';
         t.textContent = out.running ? '⏸' : '▶';
@@ -368,6 +417,7 @@ document.addEventListener('DOMContentLoaded', () => {
             document.getElementById('cfg-hysteresis').value = c.bitrate_hysteresis_seconds || 5;
             document.getElementById('cfg-stats-url').value = c.stats_url || '';
             document.getElementById('cfg-fallback-path').value = c.fallback_path || '';
+            document.getElementById('cfg-gop-validation').value = c.gop_validation_packets || 3;
         } catch (e) { /* ok */ }
     }
 
@@ -380,6 +430,7 @@ document.addEventListener('DOMContentLoaded', () => {
             fallback_path: document.getElementById('cfg-fallback-path').value.trim(),
             min_bitrate_kbps: parseInt(document.getElementById('cfg-min-bitrate').value, 10) || 0,
             bitrate_hysteresis_seconds: parseInt(document.getElementById('cfg-hysteresis').value, 10) || 5,
+            gop_validation_packets: parseInt(document.getElementById('cfg-gop-validation').value, 10) || 3,
         };
         try {
             const r = await fetch('/api/config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cfg) });
@@ -472,6 +523,85 @@ document.addEventListener('DOMContentLoaded', () => {
         } catch (e) { toast(e.message, 'error'); }
     });
     startPreview();
+
+    // ─── Bbox Receiver ───
+    async function updateBboxStatus() {
+        try {
+            const res = await fetch('/api/bbox/status');
+            const data = await res.json();
+            const badge = document.getElementById('bbox-status-badge');
+            badge.textContent = (data.status || 'unknown').toUpperCase();
+            if (data.status === 'running') {
+                badge.style.background = 'rgba(0,255,136,0.15)';
+                badge.style.color = 'var(--live)';
+            } else {
+                badge.style.background = 'rgba(255,68,68,0.15)';
+                badge.style.color = 'var(--error)';
+            }
+        } catch (e) { /* ignore */ }
+    }
+    setInterval(updateBboxStatus, 3000);
+    updateBboxStatus();
+
+    async function bboxAction(action) {
+        try {
+            const res = await fetch(`/api/bbox/action?action=${action}`, { method: 'POST' });
+            if (res.ok) { toast(`Bbox ${action} successful`, 'success'); setTimeout(updateBboxStatus, 1000); }
+            else { const d = await res.json(); toast(`Error: ${d.error}`, 'error'); }
+        } catch (e) { toast(e.message, 'error'); }
+    }
+    document.getElementById('btn-bbox-start').addEventListener('click', () => bboxAction('start'));
+    document.getElementById('btn-bbox-stop').addEventListener('click', () => bboxAction('stop'));
+    document.getElementById('btn-bbox-restart').addEventListener('click', () => bboxAction('restart'));
+
+    // Bbox Logs
+    async function showBboxLogs() {
+        openModal(document.getElementById('bbox-logs-modal'));
+        document.getElementById('bbox-logs-content').textContent = 'Loading...';
+        try {
+            const res = await fetch('/api/bbox/logs');
+            const data = await res.json();
+            document.getElementById('bbox-logs-content').textContent = data.logs || 'No logs.';
+        } catch (e) { document.getElementById('bbox-logs-content').textContent = e.message; }
+    }
+    document.getElementById('btn-bbox-logs').addEventListener('click', showBboxLogs);
+    document.getElementById('btn-refresh-bbox-logs').addEventListener('click', showBboxLogs);
+
+    // Bbox Editor
+    let currentBboxEditorMode = '';
+    async function openBboxEditor(mode) { // 'config' or 'compose'
+        currentBboxEditorMode = mode;
+        const title = mode === 'config' ? 'Edit config.json' : 'Edit docker-compose.yml';
+        document.getElementById('bbox-editor-title').textContent = title;
+        document.getElementById('bbox-editor-textarea').value = 'Loading...';
+        openModal(document.getElementById('bbox-editor-modal'));
+        
+        try {
+            const res = await fetch(`/api/bbox/${mode}`);
+            const data = await res.json();
+            document.getElementById('bbox-editor-textarea').value = data.content || '';
+        } catch (e) { document.getElementById('bbox-editor-textarea').value = `Error loading: ${e.message}`; }
+    }
+    
+    document.getElementById('btn-bbox-edit-config').addEventListener('click', () => openBboxEditor('config'));
+    document.getElementById('btn-bbox-edit-compose').addEventListener('click', () => openBboxEditor('compose'));
+    
+    document.getElementById('btn-bbox-save-editor').addEventListener('click', async () => {
+        const content = document.getElementById('bbox-editor-textarea').value;
+        try {
+            const res = await fetch(`/api/bbox/${currentBboxEditorMode}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ content })
+            });
+            if (res.ok) { 
+                toast('Saved successfully!', 'success'); 
+                closeModal(document.getElementById('bbox-editor-modal')); 
+                if (currentBboxEditorMode === 'compose') toast('Restart Bbox to apply compose changes', 'info');
+            }
+            else { const d = await res.json(); toast(`Error: ${d.error}`, 'error'); }
+        } catch (e) { toast(e.message, 'error'); }
+    });
 
     // ─── Modal Helpers ───
     function openModal(m) { if (m) m.classList.add('open'); }

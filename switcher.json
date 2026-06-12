@@ -1,9 +1,10 @@
 {
-  "srt_addr": "100.79.121.22:8282?streamid=play/stream/Belabox?srtauth=belabox",
+  "srt_addr": "localhost:8282?streamid=play/stream/belabox?srtauth=belabox",
   "srt_mode": "caller",
   "srt_timeout": 2000,
-  "stats_url": "http://100.79.121.22:3000/stats?streamer=Belabox",
+  "stats_url": "http://localhost:3000/stats?streamer=belabox",
   "fallback_path": "/opt/streamswitch/fallback.ts",
   "min_bitrate_kbps": 300,
-  "bitrate_hysteresis_seconds": 5
+  "bitrate_hysteresis_seconds": 5,
+  "gop_validation_packets": 3
 }

@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -21,7 +22,7 @@ type AudioMeter struct {
 	momentary   float64
 	mu          sync.RWMutex
 	cmd         *exec.Cmd
-	running     bool
+	running     atomic.Bool
 	stopCh      chan struct{}
 }
 
@@ -48,11 +49,11 @@ func (am *AudioMeter) GetLevels() AudioLevels {
 
 func (am *AudioMeter) Start() {
 	am.stopCh = make(chan struct{})
-	am.running = true
+	am.running.Store(true)
 	log.Println("[audio] Starting audio meter (ebur128)")
-	for am.running {
+	for am.running.Load() {
 		am.runMeterProcess()
-		if !am.running {
+		if !am.running.Load() {
 			break
 		}
 		select {
@@ -64,7 +65,7 @@ func (am *AudioMeter) Start() {
 }
 
 func (am *AudioMeter) Stop() {
-	am.running = false
+	am.running.Store(false)
 	select {
 	case <-am.stopCh:
 	default:

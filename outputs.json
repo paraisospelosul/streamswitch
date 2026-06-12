@@ -4,7 +4,7 @@
       "id": "out_youtube",
       "name": "YouTube",
       "url": "rtmp://a.rtmp.youtube.com/live2",
-      "stream_key": "key",
+      "stream_key": "YOUR_STREAM_KEY",
       "codec": "h265",
       "bitrate": 0,
       "preset": "",

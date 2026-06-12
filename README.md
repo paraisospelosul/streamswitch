@@ -6,10 +6,10 @@ Recebe um stream SRT (H.265/HEVC), monitora o fluxo de dados, e troca automatica
 
 ## Arquitetura
 
-```
-Moblin (H.265) → SRT:8282 → SRTLA/Belabox → SRT → [StreamSwitch] → RTMP
-                                                         ↑
-                                                    [Fallback .ts]
+```text
+Moblin/externo (H.265) → SRTLA://ip-vps:5000/Bbox → SRT:8282 → SRT → [StreamSwitch] → RTMP
+                                                                 ↑
+                                                            [Fallback .ts]
 ```
 
 ### Como funciona o failover
@@ -33,7 +33,7 @@ Moblin (H.265) → SRT:8282 → SRTLA/Belabox → SRT → [StreamSwitch] → RTM
 ## Instalação rápida (VPS Oracle)
 
 ```bash
-git clone <repo> /opt/streamswitch
+git clone https://github.com/seu-usuario/streamswitch /opt/streamswitch
 cd /opt/streamswitch
 bash scripts/install.sh
 ```
@@ -148,6 +148,20 @@ O arquivo `.ts` de fallback **deve** ter:
 - Container: MPEGTS
 
 Use o script `create_fallback.sh` para garantir compatibilidade.
+
+## Integração Belabox (Datagutt)
+
+O StreamSwitch possui integração nativa de gerenciamento (Start/Stop, Logs e Edição de Configuração) com o [Belabox Receiver](https://github.com/datagutt/belabox-receiver) criado por **Datagutt**. 
+Agradecimentos ao projeto open-source do Datagutt pela base sólida de agregação SRTLA.
+
+### Padrões de Entrada/Saída do Bbox
+
+As entradas padrão do Bbox seguem os seguintes formatos de StreamID para autenticação (configurados no `config.json`):
+
+| Direção | Protocolo | Porta | Formato do `streamid` | Exemplo Prático |
+|---------|-----------|-------|-----------------------|-----------------|
+| **Entrada (Mochila)** | SRTLA | `5000` | `live/stream/nomedostream?srtauth=belabox` | `srtla://ip:5000?streamid=live/stream/belabox?srtauth=belabox` |
+| **Saída (Local)** | SRT | `8282` | `play/stream/nomedostream?srtauth=belabox` | `srt://localhost:8282?streamid=play/stream/belabox?srtauth=belabox` |
 
 ## Licença
 

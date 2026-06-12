@@ -61,6 +61,7 @@ type Output struct {
 	running   atomic.Bool
 	dataCh    chan []byte
 	stopCh    chan struct{}
+	wg        sync.WaitGroup
 	mu        sync.Mutex
 
 	// Stats
@@ -260,6 +261,7 @@ func (o *Output) runProcess(broadcaster *Broadcaster) {
 	}()
 
 	// Data writer goroutine
+	o.wg.Add(1)
 	go o.writeLoop()
 
 	// Wait for process to exit
@@ -276,6 +278,7 @@ func (o *Output) runProcess(broadcaster *Broadcaster) {
 }
 
 func (o *Output) writeLoop() {
+	defer o.wg.Done()
 	defer func() {
 		o.mu.Lock()
 		if o.stdin != nil {
@@ -302,7 +305,8 @@ func (o *Output) writeLoop() {
 			_, err := stdin.Write(data)
 			if err != nil {
 				o.packetsDropped.Add(1)
-				continue
+				o.appendLog(fmt.Sprintf("Write error (broken pipe): %v", err))
+				return // Exit on broken pipe instead of spinning
 			}
 			o.packetsSent.Add(1)
 			o.bytesSent.Add(uint64(len(data)))
@@ -355,8 +359,8 @@ func (o *Output) Stop(broadcaster *Broadcaster) {
 	}
 	o.mu.Unlock()
 
-	// Give runProcess a moment to clean up
-	time.Sleep(100 * time.Millisecond)
+	// Wait for writeLoop to finish cleanly
+	o.wg.Wait()
 	o.running.Store(false)
 	log.Printf("[output:%s] Stopped", o.config.Name)
 	o.appendLog("--- Output stopped by user ---")

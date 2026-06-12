@@ -21,6 +21,9 @@ func main() {
 	srtTimeout := flag.Int("srt-timeout", 2000, "SRT timeout in ms")
 	statsURL := flag.String("stats-url", "", "HTTP URL for bbox stats")
 	dataDir := flag.String("data-dir", "", "Directory for config/data files")
+	bboxDir := flag.String("bbox-dir", "", "Directory where bbox docker-compose.yml is located (default: data-dir)")
+	webUser := flag.String("web-user", "belabox", "Web UI username for basic auth")
+	webPass := flag.String("web-pass", "belabox", "Web UI password for basic auth")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "StreamSwitch v3.0 — H.265 Failover Relay + Multi-Output RTMP\n\n")
@@ -70,6 +73,16 @@ func main() {
 	if *fallbackPath == "" {
 		*fallbackPath = filepath.Join(*dataDir, "fallback.ts")
 	}
+	if *webUser == "" {
+		if v := os.Getenv("WEB_USER"); v != "" {
+			*webUser = v
+		}
+	}
+	if *webPass == "" {
+		if v := os.Getenv("WEB_PASS"); v != "" {
+			*webPass = v
+		}
+	}
 
 	configPath := filepath.Join(*dataDir, "outputs.json")
 	switcherConfigPath := filepath.Join(*dataDir, "switcher.json")
@@ -110,9 +123,14 @@ func main() {
 	go preview.Start()
 	audioMeter := NewAudioMeter(switcher.broadcaster)
 	go audioMeter.Start()
+	
+	if *bboxDir == "" {
+		*bboxDir = *dataDir
+	}
+	bboxManager := NewBboxManager(*bboxDir)
 	recorder := NewRecorder(switcher.broadcaster, *dataDir)
 
-	apiServer := NewAPIServer(switcher, outputManager, sysStats, preview, audioMeter, recorder, *dataDir, *webPort)
+	apiServer := NewAPIServer(switcher, outputManager, sysStats, preview, audioMeter, recorder, bboxManager, *dataDir, *webPort, *webUser, *webPass)
 
 	go func() {
 		if err := switcher.Run(ctx); err != nil {
